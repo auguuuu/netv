@@ -1044,3 +1044,56 @@ class TestPlaybackHealth:
         ):
             assert auth_client.delete("/transcode/live?force=true").status_code == 404
         stop.assert_not_called()
+
+
+def _seed_lang_catalog():
+    cache = cache_module.get_cache()
+    cache["vod_categories"] = [
+        {"category_id": "1", "category_name": "FR | CINEMA", "source_id": "s"},
+        {"category_id": "2", "category_name": "NL | NETFLIX", "source_id": "s"},
+    ]
+    cache["vod_streams"] = [
+        {"name": "[FR] Avatar", "stream_id": 1, "category_id": "1", "source_id": "s"},
+        {"name": "Avatar 2", "stream_id": 2, "category_id": "1", "source_id": "s"},
+        {"name": "[NL] Avatar", "stream_id": 3, "category_id": "2", "source_id": "s"},
+        {"name": "[UK] Avatar", "stream_id": 4, "category_id": "2", "source_id": "s"},
+    ]
+    cache["series_categories"] = [{"category_id": "5", "category_name": "US | X", "source_id": "s"}]
+    cache["series"] = [
+        {"name": "Avatar TLA", "series_id": 9, "category_id": "5", "source_id": "s"},
+    ]
+
+
+def test_search_language_filter(auth_client):
+    _seed_lang_catalog()
+    base = "/search?q=avatar&vod=true&series=true"
+    all_ = auth_client.get(base).text
+    assert 'name="lang"' in all_ and "Toutes" in all_
+    fr = auth_client.get(base + "&lang=FR").text
+    assert "/movie/1" in fr and "/movie/2" in fr and "/movie/3" not in fr
+    assert "/series/9" not in fr
+    en = auth_client.get(base + "&lang=ANGLAIS").text
+    assert "/movie/4" in en and "/series/9" in en and "/movie/1" not in en
+    assert "/movie/4" not in auth_client.get(base + "&lang=US").text
+    # Unknown value is ignored (no filter)
+    assert "/movie/3" in auth_client.get(base + "&lang=BOGUS").text
+    # Counts in the dropdown cover the whole matched set
+    assert "Français (FR) (2)" in fr
+
+
+def test_search_language_filter_applies_before_limit(auth_client):
+    _seed_lang_catalog()
+    r = auth_client.get("/search?q=avatar&vod=true&limit=1&lang=NL").text
+    assert "/movie/3" in r
+
+
+def test_vod_and_series_browse_language_filter(auth_client):
+    _seed_lang_catalog()
+    r = auth_client.get("/vod?sort=alpha&lang=NL").text
+    assert "/movie/3" in r and "/movie/1" not in r
+    assert 'id="lang-select"' in r
+    r = auth_client.get("/vod?sort=alpha&category=1&lang=FR").text
+    assert "/movie/1" in r and "/movie/2" in r
+    r = auth_client.get("/series?sort=alpha&lang=US").text
+    assert "/series/9" in r
+    assert "/series/9" not in auth_client.get("/series?sort=alpha&lang=FR").text

@@ -32,6 +32,7 @@
                class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
         Series
       </label>
+      {% include "_lang_select.html" %}
       <label class="flex items-center gap-2 text-gray-400">
         <span>Limit:</span>
         <select name="limit" class="bg-gray-700 border-gray-600 rounded px-2 py-1 text-sm" onchange="this.form.submit()">
@@ -144,6 +145,7 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/js/lang-filter.js"></script>
 <script>
 let favorites = {{ favorites | tojson }};
 

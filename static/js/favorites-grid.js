@@ -61,6 +61,9 @@
       const params = new URLSearchParams();
       if (cat) params.set('category', cat);
       params.set('sort', sort);
+      const langSel = document.getElementById('lang-select');
+      // Explicit "lang=" (even empty) records a deliberate "Toutes" over the remembered choice.
+      if (langSel) params.set('lang', langSel.value);
       window.location.href = cfg.baseUrl + '?' + params;
     };
 

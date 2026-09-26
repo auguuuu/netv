@@ -49,6 +49,7 @@
         <option value="rating" {% if current_sort == 'rating' %}selected{% endif %}>Rating</option>
         <option value="newest" {% if current_sort == 'newest' %}selected{% endif %}>Newest</option>
       </select>
+      {% include "_lang_select.html" %}
     </div>
     <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 pb-4">
       {% for s in series %}
@@ -107,4 +108,5 @@ window.FAVORITES_CONFIG = {
 };
 </script>
 <script src="/static/js/favorites-grid.js"></script>
+<script src="/static/js/lang-filter.js"></script>
 {% endblock %}

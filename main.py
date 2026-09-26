@@ -94,6 +94,7 @@ from playback_policy import PlaybackHealth
 from xtream import XtreamClient
 
 import auth
+import catalog_lang
 import downloads
 import epg
 import ffmpeg_command
@@ -995,13 +996,32 @@ def _start_vod_background_load() -> None:
     threading.Thread(target=load, daemon=True).start()
 
 
+def _clean_lang(lang: str) -> str:
+    """Validate the `lang` query parameter (unknown values mean no filter)."""
+    lang = (lang or "").strip().upper()
+    return lang if lang and catalog_lang.is_valid(lang) else ""
+
+
+def _lang_options(counts: dict[str, int], current: str = "") -> list[dict]:
+    """Dropdown options with item counts; empty options are hidden unless counts are unknown."""
+    opts = []
+    for lg in catalog_lang.LANGUAGES:
+        n = counts.get(lg["key"]) if counts else None
+        if counts and not n and lg["key"] != current:
+            continue
+        opts.append({"key": lg["key"], "label": lg["label"], "hint": lg.get("hint", ""), "count": (n or 0) if counts else None})
+    return opts
+
+
 @app.get("/vod", response_class=HTMLResponse)
 async def vod_page(
     request: Request,
     user: Annotated[dict, Depends(require_auth)],
     category: int | None = None,
     sort: str | None = None,
+    lang: str = "",
 ):
+    lang = _clean_lang(lang)
     # Load from file cache if not in memory (async to avoid blocking)
     if "vod_categories" not in get_cache() or "vod_streams" not in get_cache():
         cached = await asyncio.to_thread(load_file_cache, "vod_data")
@@ -1062,6 +1082,11 @@ async def vod_page(
     if category:
         streams = [s for s in streams if str(s.get("category_id")) == str(category)]
 
+    # Language filter (counts cover the current category, before the language filter)
+    lang_names = catalog_lang.category_names(get_cache()["vod_categories"])
+    lang_options = _lang_options(catalog_lang.option_counts(streams, lang_names), lang)
+    streams = catalog_lang.filter_by_language(streams, lang, lang_names)
+
     # Sort
     if sort == "alpha":
         streams.sort(key=lambda s: (s.get("name") or "").lower())
@@ -1078,10 +1103,47 @@ async def vod_page(
             "streams": streams,
             "current_category": category,
             "current_sort": sort,
+            "current_lang": lang,
+            "lang_options": lang_options,
             "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
             "content_access": _get_content_access(username),
         },
     )
+
+
+@app.get("/api/discover")
+async def api_discover(
+    user: Annotated[dict, Depends(require_auth)],
+    lang: str = "",
+):
+    """Discovery rows for the Movies landing page (cached per catalog, day, lang)."""
+    import discover
+
+    lang = _clean_lang(lang)
+    if "vod_categories" not in get_cache() or "vod_streams" not in get_cache():
+        cached = await asyncio.to_thread(load_file_cache, "vod_data")
+        if not cached:
+            _start_vod_background_load()
+            return {"rows": [], "loading": True}
+        data, _ = cached
+        get_cache()["vod_categories"] = data["cats"]
+        get_cache()["vod_streams"] = data["streams"]
+    username = user.get("sub", "")
+    if not _get_content_access(username)["movies"]:
+        raise HTTPException(403, "Access to movies is restricted")
+    unavailable = frozenset(auth.get_user_limits(username).get("unavailable_groups", []))
+    vod_filter = frozenset(str(c) for c in load_user_settings(username).get("vod_filter", []))
+    rows = await asyncio.to_thread(
+        discover.get_rows,
+        get_cache()["vod_streams"],
+        get_cache()["vod_categories"],
+        lang,
+        None,
+        _logo_url_filter,
+        unavailable,
+        vod_filter,
+    )
+    return {"rows": rows}
 
 
 def _start_series_background_load() -> None:
@@ -1110,7 +1172,9 @@ async def series_page(
     user: Annotated[dict, Depends(require_auth)],
     category: int | None = None,
     sort: str | None = None,
+    lang: str = "",
 ):
+    lang = _clean_lang(lang)
     # Load from file cache if not in memory (async to avoid blocking)
     if "series_categories" not in get_cache() or "series" not in get_cache():
         cached = await asyncio.to_thread(load_file_cache, "series_data")
@@ -1171,6 +1235,11 @@ async def series_page(
     if category:
         series = [s for s in series if str(s.get("category_id")) == str(category)]
 
+    # Language filter (counts cover the current category, before the language filter)
+    lang_names = catalog_lang.category_names(get_cache()["series_categories"])
+    lang_options = _lang_options(catalog_lang.option_counts(series, lang_names), lang)
+    series = catalog_lang.filter_by_language(series, lang, lang_names)
+
     # Sort
     if sort == "alpha":
         series.sort(key=lambda s: (s.get("name") or "").lower())
@@ -1187,6 +1256,8 @@ async def series_page(
             "series": series,
             "current_category": category,
             "current_sort": sort,
+            "current_lang": lang,
+            "lang_options": lang_options,
             "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
             "content_access": _get_content_access(username),
         },
@@ -1761,8 +1832,13 @@ async def search_page(
     vod: bool = False,
     series: bool = False,
     limit: int = 100,
+    lang: str = "",
 ):
     results: dict[str, list] = {"live": [], "vod": [], "series": []}
+    lang = _clean_lang(lang)
+    lang_counts: dict[str, int] = {}
+    lang_matched: list[dict] = []
+    lang_names: dict[tuple[str, str], str] = {}
 
     # Default all on if none specified
     if not live and not vod and not series:
@@ -1813,8 +1889,12 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["vod_categories"] = vod_cats
                     get_cache()["vod_streams"] = vod_streams
+            matched = [s for s in get_cache()["vod_streams"] if match_fn(s.get("name") or "")]
+            cat_names = catalog_lang.category_names(get_cache().get("vod_categories", []))
+            lang_matched += matched
+            lang_names.update(cat_names)
             matched = sorted(
-                [s for s in get_cache()["vod_streams"] if match_fn(s.get("name") or "")],
+                catalog_lang.filter_by_language(matched, lang, cat_names),
                 key=lambda x: x.get("name", "").lower(),
             )
             results["vod"] = matched[:limit] if limit else matched
@@ -1826,8 +1906,12 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["series_categories"] = series_cats
                     get_cache()["series"] = series_list
+            matched = [s for s in get_cache()["series"] if match_fn(s.get("name") or "")]
+            cat_names = catalog_lang.category_names(get_cache().get("series_categories", []))
+            lang_matched += matched
+            lang_names.update(cat_names)
             matched = sorted(
-                [s for s in get_cache()["series"] if match_fn(s.get("name") or "")],
+                catalog_lang.filter_by_language(matched, lang, cat_names),
                 key=lambda x: x.get("name", "").lower(),
             )
             results["series"] = matched[:limit] if limit else matched
@@ -1878,6 +1962,9 @@ async def search_page(
             s for s in results["series"] if str(s.get("category_id")) in series_filter_set
         ]
 
+    if lang_matched:
+        lang_counts = catalog_lang.option_counts(lang_matched, lang_names)
+
     content_access = _get_content_access(username)
     return TEMPLATES.TemplateResponse(
         request,
@@ -1890,6 +1977,8 @@ async def search_page(
             "search_vod": vod and content_access["movies"],
             "search_series": series and content_access["series"],
             "limit": limit,
+            "current_lang": lang,
+            "lang_options": _lang_options(lang_counts, lang),
             "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
             "content_access": content_access,
         },

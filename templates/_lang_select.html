@@ -1,0 +1,10 @@
+{# Dropdown "Langue". Expects lang_options and current_lang. The label is the provider's, not the real audio. #}
+<label class="flex items-center gap-2 text-sm text-gray-400" title="Langue annoncée par le fournisseur (préfixe du titre ou de la catégorie), pas la piste audio réelle">
+  <span>Langue :</span>
+  <select id="lang-select" name="lang" class="bg-gray-700 text-white border-gray-600 rounded px-2 py-1 text-sm">
+    <option value="">Toutes</option>
+    {% for o in lang_options %}
+    <option value="{{ o.key }}" {% if current_lang == o.key %}selected{% endif %}{% if o.hint %} title="{{ o.hint }}"{% endif %}>{{ o.label }}{% if o.count is not none %} ({{ o.count }}){% endif %}</option>
+    {% endfor %}
+  </select>
+</label>

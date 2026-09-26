@@ -1,0 +1,48 @@
+/* Netflix style discovery rows (Movies landing). Plain CSS, matches the neTV dark palette. */
+#no-favorites { display: none !important; }
+#favorites-section:has(#favorites-grid:empty) #favorites-title { display: none; }
+.disc-fav-row { scroll-snap-type: x proximity; }
+.disc-fav-row > * { flex: 0 0 auto; width: var(--disc-card-w); scroll-snap-align: start; }
+
+#discover-rows, #favorites-section { --disc-card-w: 7.5rem; }
+@media (min-width: 640px)  { #discover-rows, #favorites-section { --disc-card-w: 9rem; } }
+@media (min-width: 1024px) { #discover-rows, #favorites-section { --disc-card-w: 10.5rem; } }
+@media (min-width: 1536px) { #discover-rows, #favorites-section { --disc-card-w: 12rem; } }
+
+.disc-row { position: relative; margin-bottom: 1.25rem; }
+.disc-title { font-size: 1.05rem; font-weight: 600; margin: 0 0 0.5rem; color: #f3f4f6; }
+@media (min-width: 640px) { .disc-title { font-size: 1.2rem; } }
+.disc-viewport { position: relative; }
+.disc-track {
+  display: flex; gap: 0.5rem; overflow-x: auto; overflow-y: hidden;
+  scroll-snap-type: x mandatory; scroll-padding: 0 0.25rem;
+  padding: 4px 4px 8px; scrollbar-width: none; -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+.disc-track::-webkit-scrollbar { display: none; }
+.disc-card { flex: 0 0 var(--disc-card-w); scroll-snap-align: start; }
+.disc-card > a { display: block; }
+.disc-card .disc-poster { aspect-ratio: 2 / 3; }
+.disc-card img { transition: opacity .2s; }
+.disc-card img.disc-loading { opacity: 0; }
+
+.disc-arrow {
+  position: absolute; top: 0; bottom: 2rem; width: 2.5rem; z-index: 20;
+  display: flex; align-items: center; justify-content: center;
+  border: 0; color: #fff; font-size: 1.6rem; cursor: pointer; opacity: 0;
+  transition: opacity .15s; background: linear-gradient(to right, rgba(17,24,39,.92), rgba(17,24,39,0));
+}
+.disc-arrow.disc-next { right: 0; background: linear-gradient(to left, rgba(17,24,39,.92), rgba(17,24,39,0)); }
+.disc-arrow.disc-prev { left: 0; }
+.disc-viewport:hover .disc-arrow:not([disabled]), .disc-arrow:focus-visible { opacity: 1; }
+.disc-arrow[disabled] { display: none; }
+@media (hover: none) { .disc-arrow { display: none; } }
+
+/* Skeletons */
+.disc-title-skel { height: 1.1rem; width: 12rem; border-radius: 0.25rem; margin-bottom: 0.6rem; background: rgb(55 65 81); }
+.disc-card-skel { flex: 0 0 var(--disc-card-w); aspect-ratio: 2 / 3; border-radius: 0.5rem; background: rgb(31 41 55); }
+.disc-skel .disc-title-skel, .disc-skel .disc-card-skel { animation: disc-pulse 1.4s ease-in-out infinite; }
+.disc-skel .disc-track { overflow: hidden; }
+@keyframes disc-pulse { 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .disc-skel * { animation: none !important; } }
+.disc-empty { color: rgb(156 163 175); padding: 2rem 0; text-align: center; }

@@ -49,6 +49,7 @@
         <option value="rating" {% if current_sort == 'rating' %}selected{% endif %}>Rating</option>
         <option value="newest" {% if current_sort == 'newest' %}selected{% endif %}>Newest</option>
       </select>
+      {% include "_lang_select.html" %}
     </div>
     <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 pb-4">
       {% for movie in streams %}
@@ -81,12 +82,28 @@
   {% else %}
   <!-- Favorites view -->
   <div id="favorites-section" class="flex-1 min-h-0 overflow-auto scroll-ring-safe">
-    <h3 class="text-xl font-semibold mb-4">★ My Favorites</h3>
-    <div id="favorites-grid" class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 pb-4">
+    <link rel="stylesheet" href="/static/css/discover.css">
+    <h3 id="favorites-title" class="text-lg sm:text-xl font-semibold mb-2">★ Favoris</h3>
+    <div id="favorites-grid" class="disc-fav-row flex gap-2 sm:gap-3 overflow-x-auto pb-4">
     </div>
-    <div id="no-favorites" class="hidden text-center text-gray-400 py-12">
-      <p class="text-xl mb-2">No favorites yet</p>
-      <p>Use Search or Browse All to find movies, then click ☆ to add</p>
+    <div id="no-favorites" class="hidden">
+      <p>No favorites yet</p>
+    </div>
+    <!-- Discovery rows, filled client side from /api/discover -->
+    <div class="flex flex-wrap items-center justify-between gap-2 mb-2 mt-1">
+      <span class="text-sm text-gray-400">Découvrir</span>
+      <div class="flex items-center gap-2">
+        {% include "_lang_select.html" %}
+        <a href="/vod?sort=rating" class="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 focusable text-sm" tabindex="0">Tout parcourir</a>
+      </div>
+    </div>
+    <div id="discover-rows" aria-live="polite">
+      {% for _ in range(3) %}
+      <div class="disc-row disc-skel" aria-hidden="true">
+        <div class="disc-title-skel"></div>
+        <div class="disc-track">{% for _ in range(10) %}<div class="disc-card-skel"></div>{% endfor %}</div>
+      </div>
+      {% endfor %}
     </div>
   </div>
   {% endif %}
@@ -108,4 +125,6 @@ window.FAVORITES_CONFIG = {
 };
 </script>
 <script src="/static/js/favorites-grid.js"></script>
+<script src="/static/js/lang-filter.js"></script>
+{% if current_sort is none %}<script src="/static/js/discover.js" defer></script>{% endif %}
 {% endblock %}

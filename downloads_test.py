@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from downloads import DownloadManager
+from downloads import DownloadManager, SlowWatch
 
 import downloads
 
@@ -32,6 +32,8 @@ class FakeProvider:
         self.delay = 0.0  # seconds between 50 KB chunks
         self.drop_after: int | None = None  # cut the connection once after N bytes
         self.ignore_range = False
+        self.slow_after: int | None = None  # first connection only: throttle after N bytes
+        self.slow_delay = 0.1
         self.status_override: int | None = None
         self.content_type = "video/x-matroska"
         provider = self
@@ -47,6 +49,8 @@ class FakeProvider:
                 provider.hits.append((self.path, rng))
                 if provider.status_override:
                     self.send_response(provider.status_override)
+                    if provider.status_override == 416:
+                        self.send_header("Content-Range", f"bytes */{SIZE}")
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
@@ -66,6 +70,9 @@ class FakeProvider:
                 limit = provider.drop_after
                 if limit is not None:
                     provider.drop_after = None  # only once
+                slow_after = provider.slow_after
+                if slow_after is not None:
+                    provider.slow_after = None  # only the first connection is throttled
                 try:
                     while sent < len(body):
                         n = min(50_000, len(body) - sent)
@@ -80,6 +87,8 @@ class FakeProvider:
                         sent += n
                         if provider.delay:
                             time.sleep(provider.delay)
+                        if slow_after is not None and sent >= slow_after:
+                            time.sleep(provider.slow_delay)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
 
@@ -503,3 +512,118 @@ def test_safe_name_helpers() -> None:
     assert len(downloads.safe_name("x" * 500, "f")) <= 150
     assert downloads.safe_ext("../MKV!") == "mkv"
     assert downloads.safe_ext("") == "mkv"
+
+
+# ---------------------------------------------------------------- slow connection watchdog
+
+
+def _feed(w: SlowWatch, start: float, seconds: int, rate: float, done: float) -> tuple[float, bool]:
+    """Feed one sample per second at ``rate`` bytes/s until it asks to reconnect.
+
+    Returns (done, second of the reconnect request or -1), like the real read loop
+    which drops the connection at the first request.
+    """
+    for i in range(1, seconds + 1):
+        done += rate
+        if w.feed(start + i, int(done)):
+            return done, i
+    return done, -1
+
+
+def test_slowwatch_steady_speed_never_reconnects() -> None:
+    w = SlowWatch(window=1, patience=3, fast_enough=1e12)
+    w.new_connection(0, 0)
+    _, fired = _feed(w, 0, 120, 10e6, 0)
+    assert fired < 0 and w.reconnects == 0
+
+
+def test_slowwatch_detects_throttle_after_patience() -> None:
+    w = SlowWatch(window=1, patience=3, fast_enough=1e12)
+    w.new_connection(0, 0)
+    done, fired = _feed(w, 0, 60, 15e6, 0)  # fast for a minute
+    assert fired < 0
+    _, fired = _feed(w, 60, 20, 1.4e6, done)  # then throttled to 1.4 MB/s
+    assert 3 <= fired <= 5  # about `patience` seconds after the drop
+    assert w.reconnects == 1
+
+
+def test_slowwatch_ignores_speeds_that_are_already_fast() -> None:
+    w = SlowWatch(window=1, patience=3)  # default fast_enough = 8 MB/s
+    w.new_connection(0, 0)
+    done, _ = _feed(w, 0, 30, 40e6, 0)
+    _, fired = _feed(w, 30, 30, 12e6, done)  # 3x slower than best, but still fast
+    assert fired < 0
+
+
+def test_slowwatch_backs_off_when_reconnect_does_not_help_and_resets_when_it_does() -> None:
+    w = SlowWatch(window=1, patience=3, fast_enough=1e12, max_patience=100)
+    w.new_connection(0, 0)
+    done, _ = _feed(w, 0, 30, 15e6, 0)
+    done, fired = _feed(w, 30, 20, 1.4e6, done)
+    assert fired > 0 and w.patience == 3
+    # reconnect, still slow: patience doubles (6), then 12
+    w.new_connection(50, done)
+    done, fired = _feed(w, 50, 30, 1.4e6, done)
+    assert fired >= 6 and w.patience == 6
+    w.new_connection(80, done)
+    done, fired = _feed(w, 80, 40, 1.4e6, done)
+    assert fired >= 12 and w.patience == 12
+    # a reconnect that restores the speed resets the patience
+    w.new_connection(120, done)
+    done, _ = _feed(w, 120, 10, 15e6, done)
+    assert w.patience == 3
+
+
+def test_slowwatch_reference_rate_decays_when_provider_is_just_slow() -> None:
+    w = SlowWatch(window=1, patience=3, fast_enough=1e12)
+    w.new_connection(0, 0)
+    done, _ = _feed(w, 0, 10, 15e6, 0)
+    fired_at = []
+    t = 10
+    for _ in range(40):  # a long stretch at 3 MB/s (still 5x slower than the old best)
+        done, fired = _feed(w, t, 30, 3e6, done)
+        fired_at.append(fired)
+        t += 30
+        if fired > 0:
+            w.new_connection(t, done)
+    assert fired_at[-1] < 0 and fired_at[-2] < 0  # eventually it stops churning
+
+
+def test_slow_connection_is_replaced_and_file_stays_intact(
+    tmp_path: Path, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(downloads, "CHUNK_SIZE", 50_000)  # one read per server chunk
+    provider.delay = 0.01
+    provider.slow_after = 300_000
+    provider.slow_delay = 0.15
+    mgr = make_manager(
+        tmp_path,
+        provider,
+        slow_watch=lambda: SlowWatch(window=0.06, patience=0.15, fast_enough=1e12),
+    )
+    e = mgr.add("movie", "1", title="Throttled")
+    wait_for(lambda: e.status == "done")
+    assert (mgr.dir / e.filename).read_bytes() == DATA
+    hits = [r for _, r in provider.hits]
+    assert len(hits) >= 2 and hits[0] is None
+    assert hits[1] and hits[1].startswith("bytes=") and hits[1] != "bytes=0-"
+
+
+def test_part_file_already_complete_is_finished_not_deleted(
+    tmp_path: Path, provider: FakeProvider
+) -> None:
+    # The .part holds the whole file but the entry was never finalized (e.g. the
+    # bytes arrived through another channel): the provider answers 416 to
+    # "bytes=SIZE-" and we must finish the download instead of deleting the file.
+    provider.delay = 0.05
+    mgr = make_manager(tmp_path, provider)
+    e = mgr.add("movie", "1", title="Whole", ext="mkv")
+    wait_for(lambda: e.bytes_done > 50_000)
+    mgr.pause(e.id)
+    wait_for(lambda: e.id not in mgr._running)
+    (mgr.dir / (e.filename + ".part")).write_bytes(DATA)
+    provider.status_override = 416
+    mgr.resume(e.id)
+    wait_for(lambda: e.status == "done")
+    assert (mgr.dir / e.filename).read_bytes() == DATA
+    assert not (mgr.dir / (e.filename + ".part")).exists()

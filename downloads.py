@@ -125,6 +125,86 @@ class _Fatal(Exception):
     """Non retryable failure, message is shown to the user."""
 
 
+class _Reconnect(ConnectionError):
+    """The connection got much slower than before: drop it and resume with a fresh one."""
+
+
+class SlowWatch:
+    """Detects a connection that throttled itself and asks for a reconnect.
+
+    Some providers serve a new connection at full speed for about a minute (a
+    few hundred MB) and then throttle it to ~1 MB/s, while a fresh connection is
+    fast again (measured on a real provider: 15-20 MB/s, then 1.4 MB/s after
+    ~60 s, back to 15-20 MB/s after a reconnect). So we compare each window's
+    rate to the best recent rate of this download and, when it stays far below
+    for ``patience`` seconds, ask the caller to reconnect (the download resumes
+    with a Range request, nothing is lost).
+
+    Guards against pointless churn:
+    - never reconnect while the rate is already good (``fast_enough``),
+    - if a reconnect did not bring the speed back (< 1.5x the slow rate), wait
+      twice as long before the next one (up to ``max_patience``), and go back to
+      the base patience as soon as one helps,
+    - the reference rate decays slowly, so a provider that is simply slower for
+      a while stops triggering reconnects after a few minutes.
+    """
+
+    def __init__(
+        self,
+        window: float = 5.0,
+        patience: float = 10.0,
+        slow_ratio: float = 0.4,
+        fast_enough: float = 8 * 1024 * 1024,
+        max_patience: float = 300.0,
+        decay: float = 0.98,
+    ) -> None:
+        self.window = window
+        self.base_patience = patience
+        self.patience = patience
+        self.slow_ratio = slow_ratio
+        self.fast_enough = fast_enough
+        self.max_patience = max_patience
+        self.decay = decay
+        self.best = 0.0  # best recent window rate, bytes/s
+        self.reconnects = 0
+        self._before: float | None = None  # slow rate that triggered the last reconnect
+        self._reset(0.0, 0)
+
+    def _reset(self, now: float, done: int) -> None:
+        self._w_start = now
+        self._w_done = done
+        self._slow_since: float | None = None
+
+    def new_connection(self, now: float, done: int) -> None:
+        self._reset(now, done)
+
+    def feed(self, now: float, done: int) -> bool:
+        """Call after each chunk. True when the connection should be replaced."""
+        elapsed = now - self._w_start
+        if elapsed < self.window:
+            return False
+        rate = (done - self._w_done) / elapsed
+        window_start = self._w_start
+        self._w_start, self._w_done = now, done
+        if self._before is not None:  # first full window after a reconnect: did it help?
+            if rate > self._before * 1.5:
+                self.patience = self.base_patience
+            else:
+                self.patience = min(self.patience * 2, self.max_patience)
+            self._before = None
+        self.best = max(rate, self.best * self.decay)
+        if rate >= self.fast_enough or rate >= self.slow_ratio * self.best:
+            self._slow_since = None
+            return False
+        if self._slow_since is None:
+            self._slow_since = window_start
+        if now - self._slow_since >= self.patience:
+            self._before = rate
+            self.reconnects += 1
+            return True
+        return False
+
+
 class _Ctl:
     """Per run control block, one per download thread."""
 
@@ -156,6 +236,7 @@ class DownloadManager:
         max_retries: int = 4,
         timeout: float = 30.0,
         tick_interval: float = 2.0,
+        slow_watch: Callable[[], SlowWatch] = SlowWatch,
     ) -> None:
         """``source_limits(source_id)`` returns (max_streams, active_playback_sessions)."""
         self.dir = pathlib.Path(directory).expanduser()
@@ -169,6 +250,8 @@ class DownloadManager:
         self.max_retries = max_retries
         self.timeout = timeout
         self.tick_interval = tick_interval
+        self._slow_watch = slow_watch
+        self._watches: dict[str, SlowWatch] = {}
         self._lock = threading.RLock()
         self._entries: dict[str, Entry] = {}
         self._running: dict[str, tuple[_Ctl, str]] = {}  # id -> (ctl, filename)
@@ -594,8 +677,13 @@ class DownloadManager:
                 raise ConnectionError("connection closed before the file was complete")
             except (_Stopped, _Fatal):
                 raise
+            except _Reconnect as exc:
+                log.info("Download %s: %s", e.filename, exc)
+                continue  # progress was made, resume right away with a fresh connection
             except urllib.error.HTTPError as exc:
                 if exc.code == 416:
+                    if self._already_complete(e, ctl, part, exc):
+                        return
                     self._unlink(part)  # our offset is bogus, start again
                 elif exc.code not in RETRYABLE_HTTP:
                     raise _Fatal(f"Provider answered HTTP {exc.code} {exc.reason}") from exc
@@ -650,7 +738,9 @@ class DownloadManager:
                     f"have {self.free_bytes() // 1024**2} MB)"
                 )
             samples = self._samples.setdefault(e.id, deque(maxlen=200))
+            watch = self._watches.setdefault(e.id, self._slow_watch())
             done = have
+            watch.new_connection(time.time(), done)
             with open(part, mode) as f:
                 while True:
                     ctl.check()
@@ -665,11 +755,32 @@ class DownloadManager:
                         raise
                     done += len(chunk)
                     e.bytes_done = done
-                    samples.append((time.time(), done))
+                    now = time.time()
+                    samples.append((now, done))
+                    if watch.feed(now, done) and (not total or done < total):
+                        raise _Reconnect(
+                            f"connection slowed down (best {watch.best / 1e6:.1f} MB/s), "
+                            f"reconnecting (#{watch.reconnects})"
+                        )
         if total and done < total:
             return False
         if total and done > total:
             raise _Fatal("Received more data than announced")
+        self._finalize(e, ctl, part, done)
+        return True
+
+    def _already_complete(
+        self, e: Entry, ctl: _Ctl, part: pathlib.Path, exc: urllib.error.HTTPError
+    ) -> bool:
+        """416 on a Range request: the .part may already hold the whole file."""
+        m = re.match(r"bytes \*/(\d+)", exc.headers.get("Content-Range", "") if exc.headers else "")
+        if not m or not part.exists() or part.stat().st_size != int(m.group(1)):
+            return False
+        e.bytes_total = int(m.group(1))
+        self._finalize(e, ctl, part, e.bytes_total)
+        return True
+
+    def _finalize(self, e: Entry, ctl: _Ctl, part: pathlib.Path, done: int) -> None:
         with self._lock:
             if ctl.stop.is_set():
                 raise _Stopped
@@ -678,7 +789,7 @@ class DownloadManager:
             e.bytes_done = e.bytes_total = done
             e.finished_at = time.time()
             e.error = None
-        return True
+            self._watches.pop(e.id, None)
 
 
 # ============================================================================
