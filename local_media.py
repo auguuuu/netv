@@ -54,7 +54,7 @@ import downloads
 
 log = logging.getLogger(__name__)
 
-PLAN_VERSION = 3  # bump when the plan / segment layout changes (invalidates caches)
+PLAN_VERSION = 4  # bump when the plan / segment layout changes (invalidates caches)
 TARGET_SEGMENT_SEC = 6.0
 MAX_COPY_SEGMENT_SEC = 90.0  # longer keyframe gaps: re-encode on a fixed grid instead
 TIMELINE_OFFSET = 1.0  # seconds added to every timestamp (keeps dts >= 0 with B-frames)
@@ -683,13 +683,19 @@ def video_x264_cmd(path: str, info: MediaInfo, seg: VideoSeg, t0: float) -> list
 
 
 def audio_copy_cmd(path: str, info: MediaInfo, a: AudioInfo, grid: AudioGrid, k: int) -> list[str]:
-    """Stream copy of the AAC frames of segment k (cut on frame boundaries)."""
+    """Stream copy of the AAC frames of segment k (cut on frame boundaries).
+
+    ``-copypriorss 0`` is essential: an input seek on a real mkv lands on the cue point
+    BEFORE the target (often 1 to 2 s earlier), and without it ffmpeg copies every packet
+    from there, so the segment holds audio from earlier than its timestamp (the sound
+    then lags the picture by up to seconds). It drops the packets before the seek time.
+    """
     seek = (a.start - info.start) + grid.seg_start_samples(k) / grid.sample_rate
     seek -= AAC_FRAME / (2 * grid.sample_rate)  # land in the middle of the frame before
     return [
         "ffmpeg", "-nostdin", "-v", "error", "-y",
         *_seek_args(seek),
-        "-i", path, "-map", f"0:{a.index}", "-c:a", "copy",
+        "-i", path, "-map", f"0:{a.index}", "-c:a", "copy", "-copypriorss", "0",
         "-frames:a", str(grid.seg_frames(k)), "-vn", "-sn", "-dn",
         "-f", "mp4", "-movflags", "empty_moov+default_base_moof", "pipe:1",
     ]  # fmt: skip

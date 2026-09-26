@@ -1092,3 +1092,55 @@ def test_download_page_is_driven_by_the_local_id_not_the_transcoder(page_client)
 def test_transcode_start_still_refuses_files_outside_the_download_folder(page_client):
     r = page_client.get("/transcode/start", params={"url": "/etc/hosts", "content_type": "movie"})
     assert r.status_code == 400
+
+
+# --------------------------------------------------------------------------- regression: audio sync
+
+
+def test_audio_copy_drops_packets_before_the_seek_time():
+    grid = plan_audio_grid(600.0, 48000)
+    cmd = audio_copy_cmd("/x/f.mkv", media("mkv", a=(audio("aac"),)), audio("aac"), grid, 2)
+    assert cmd[cmd.index("-copypriorss") + 1] == "0"
+
+
+def _dominant_hz(pcm: bytes, rate: int) -> float:
+    """Frequency of a pure sweep over a short window, from its zero crossings."""
+    samples = array.array("f", pcm)
+    crossings = sum(1 for a, b in zip(samples, samples[1:], strict=False) if (a < 0) != (b < 0))
+    return crossings / 2 / (len(samples) / rate)
+
+
+@pytest.mark.skipif(not HAVE_FFMPEG, reason="ffmpeg not installed")
+def test_copied_audio_segments_hold_the_audio_of_their_own_time(tmp_path: Path):
+    """A real mkv has sparse cue points (one per 10 s GOP here). An input seek lands on the cue
+    BEFORE the target, and the copied audio then started seconds too early (sound lagging the
+    picture by up to 2 s on real downloads). The sweep makes every instant identifiable: the
+    frequency at time t is 200 + 40 t Hz."""
+    src = tmp_path / "sweep.mkv"
+    ffmpeg(
+        "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=25:duration=60",
+        "-f", "lavfi", "-i", "aevalsrc=sin(2*PI*(200*t+20*t*t)):s=48000:d=60",
+        "-c:v", "libx264", "-g", "250", "-keyint_min", "250", "-sc_threshold", "0",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", str(src),
+    )  # fmt: skip
+
+    async def run() -> list[tuple[float, float]]:
+        lm = LocalMedia(cache_root=tmp_path / "cache", max_bytes=1 << 30)
+        pres = await lm.presentation(src, "copy")
+        out = []
+        for k in (3, 5, 8):  # 18 s, 30 s, 48 s: inside a GOP, not on a cue
+            seg = await lm.audio_segment(pres, 0, k)
+            joined = tmp_path / f"a{k}.mp4"
+            joined.write_bytes((seg.parent / "init.mp4").read_bytes() + seg.read_bytes())
+            raw = subprocess.run(
+                ["ffmpeg", "-v", "error", "-i", str(joined), "-t", "0.3", "-ac", "1",
+                 "-ar", "48000", "-f", "f32le", "-"],
+                capture_output=True, check=True,
+            ).stdout  # fmt: skip
+            start = pres.audio_grids[0].seg_start_samples(k) / 48000
+            out.append((start, (_dominant_hz(raw, 48000) - 200) / 40))
+        return out
+
+    # the 0.3 s window is centered 0.15 s after the segment start; the old bug was 1 to 2 s off
+    for claimed, heard in asyncio.run(run()):
+        assert heard == pytest.approx(claimed + 0.15, abs=0.1), (claimed, heard)
