@@ -130,24 +130,60 @@ class _Reconnect(ConnectionError):
 
 
 class SlowWatch:
-    """Detects a connection that throttled itself and asks for a reconnect.
+    """Keeps a download fast on providers that throttle each connection.
 
-    Some providers serve a new connection at full speed for about a minute (a
-    few hundred MB) and then throttle it to ~1 MB/s, while a fresh connection is
-    fast again (measured on a real provider: 15-20 MB/s, then 1.4 MB/s after
-    ~60 s, back to 15-20 MB/s after a reconnect). So we compare each window's
-    rate to the best recent rate of this download and, when it stays far below
-    for ``patience`` seconds, ask the caller to reconnect (the download resumes
-    with a Range request, nothing is lost).
+    Two mechanisms work together.
 
-    Guards against pointless churn:
-    - never reconnect while the rate is already good (``fast_enough``),
-    - if a reconnect did not bring the speed back (< 1.5x the slow rate), wait
-      twice as long before the next one (up to ``max_patience``), and go back to
-      the base patience as soon as one helps,
-    - the reference rate decays slowly, so a provider that is simply slower for
-      a while stops triggering reconnects after a few minutes.
+    1. Slow connection watchdog (reactive). Some providers serve a new connection
+       at full speed for a while (a few hundred MB) and then throttle it to
+       ~1 to 2 MB/s, while a fresh connection is fast again. We compare each
+       window's rate to the best recent rate of this download and, when it stays
+       far below for ``patience`` seconds, ask the caller to reconnect (the
+       download resumes with a Range request, nothing is lost). Guards against
+       pointless churn:
+       - never reconnect while the rate is already good (``fast_enough``),
+       - if a reconnect did not bring the speed back (< 1.5x the slow rate), wait
+         twice as long before the next one (up to ``max_patience``), and go back
+         to the base patience as soon as one helps,
+       - the reference rate decays slowly, so a provider that is simply slower
+         for a while stops triggering reconnects after a few minutes.
+
+    2. Burst rotation (proactive). Measured on a real provider (XUI style "VOD
+       protection"): the full speed part of a response is a fixed FRACTION of that
+       response's Content-Length (exactly 15 % of the Range length, whatever the
+       file, the offset, the idle time or the User-Agent), then the rate falls to
+       about 1.9x the film's average bitrate. Waiting for the watchdog wastes 15 s
+       at the slow rate per connection, and because each reconnect asks for the
+       remaining bytes the bursts shrink by 15 % each time, so the tail of a big
+       file crawled at 2 MB/s. Once the fraction is known, the connection is
+       dropped right after ``fraction * margin`` of its response and a new Range
+       starts (about 0.3 s per request), which keeps the whole file at full speed
+       (measured 2.5x faster than the watchdog alone on 1 GB of an 8 GB film).
+       The fraction is learned, not assumed: the first throttled connection tells
+       it (bytes received before the rate fell, divided by the announced length),
+       and every later connection that shows a fall before the planned cut
+       corrects it. Nothing changes on providers that do not throttle (the
+       fraction stays unknown and the connection is never rotated).
+
+    Knobs (all optional):
+    - window, patience, slow_ratio, fast_enough, max_patience, decay: watchdog
+      as described above.
+    - burst_fraction: known fraction of the response served fast (0.15 for the
+      measured provider); 0 means learn it. The manager remembers what was learned
+      per provider host and seeds new downloads with it.
+    - burst_margin: cut at this share of the fraction (default 0.95) so that we
+      stop just before the throttle starts.
+    - min_burst: do not rotate when the planned fast part is smaller than this
+      (default 4 MiB, a new request costs about 0.3 s, so tiny bursts and the tail
+      of a file are simply read to the end).
+    - knee_window, knee_ratio: how the end of the burst is measured, a sub-window
+      of ``knee_window`` seconds is "slow" below ``knee_ratio`` of the peak of the
+      connection, and two slow sub-windows in a row mark the end of the burst.
+    - rotate: set False to disable the proactive part.
     """
+
+    MIN_FRACTION = 0.02
+    MAX_FRACTION = 0.6
 
     def __init__(
         self,
@@ -157,6 +193,12 @@ class SlowWatch:
         fast_enough: float = 8 * 1024 * 1024,
         max_patience: float = 300.0,
         decay: float = 0.98,
+        burst_fraction: float = 0.0,
+        burst_margin: float = 0.95,
+        min_burst: int = 4 * 1024 * 1024,
+        knee_window: float = 0.5,
+        knee_ratio: float = 0.35,
+        rotate: bool = True,
     ) -> None:
         self.window = window
         self.base_patience = patience
@@ -165,21 +207,80 @@ class SlowWatch:
         self.fast_enough = fast_enough
         self.max_patience = max_patience
         self.decay = decay
+        self.fraction = burst_fraction
+        self.burst_margin = burst_margin
+        self.min_burst = min_burst
+        self.knee_window = knee_window
+        self.knee_ratio = knee_ratio
+        self.rotate = rotate
         self.best = 0.0  # best recent window rate, bytes/s
         self.reconnects = 0
+        self.rotations = 0
         self._before: float | None = None  # slow rate that triggered the last reconnect
+        self._c_start = 0  # position where the current connection began
+        self._c_len = 0  # bytes announced for the current connection (0 = unknown)
         self._reset(0.0, 0)
+        self._reset_knee(0.0, 0)
 
     def _reset(self, now: float, done: int) -> None:
         self._w_start = now
         self._w_done = done
         self._slow_since: float | None = None
 
-    def new_connection(self, now: float, done: int) -> None:
+    def _reset_knee(self, now: float, done: int) -> None:
+        self._k_start = now
+        self._k_done = done
+        self._k_peak = 0.0
+        self._k_good_done = done  # position at the end of the last fast sub-window
+        self._k_slow_run = 0
+        self._knee: int | None = None  # bytes received when the burst ended
+
+    def _learn(self) -> None:
+        """At the end of a connection: if we saw where its burst ended, keep the fraction."""
+        if self._knee is not None and self._c_len > 0:
+            f = self._knee / self._c_len
+            if self.MIN_FRACTION <= f <= self.MAX_FRACTION:
+                self.fraction = f
+
+    def new_connection(self, now: float, done: int, length: int = 0) -> None:
+        """A new response starts at ``done``; ``length`` is its announced size if known."""
+        self._learn()
         self._reset(now, done)
+        self._reset_knee(now, done)
+        self._c_start = done
+        self._c_len = length
+
+    def _track_knee(self, now: float, done: int) -> None:
+        el = now - self._k_start
+        if el < self.knee_window:
+            return
+        rate = (done - self._k_done) / el
+        self._k_start, self._k_done = now, done
+        self._k_peak = max(self._k_peak, rate)
+        if rate >= self.knee_ratio * self._k_peak:
+            self._k_good_done = done
+            self._k_slow_run = 0
+            return
+        self._k_slow_run += 1
+        if self._k_slow_run >= 2 and self._knee is None:
+            self._knee = self._k_good_done - self._c_start
+
+    def should_rotate(self, done: int) -> bool:
+        """True when the fast part of this response is spent and a new one should start."""
+        if not (self.rotate and self.fraction > 0 and self._c_len > 0):
+            return False
+        budget = self.fraction * self.burst_margin * self._c_len
+        if budget < self.min_burst:
+            return False
+        got = done - self._c_start
+        if got < budget or got >= self._c_len:
+            return False
+        self.rotations += 1
+        return True
 
     def feed(self, now: float, done: int) -> bool:
         """Call after each chunk. True when the connection should be replaced."""
+        self._track_knee(now, done)
         elapsed = now - self._w_start
         if elapsed < self.window:
             return False
@@ -252,6 +353,7 @@ class DownloadManager:
         self.tick_interval = tick_interval
         self._slow_watch = slow_watch
         self._watches: dict[str, SlowWatch] = {}
+        self._fractions: dict[str, float] = {}  # provider host -> learned fast fraction
         self._lock = threading.RLock()
         self._entries: dict[str, Entry] = {}
         self._running: dict[str, tuple[_Ctl, str]] = {}  # id -> (ctl, filename)
@@ -739,8 +841,15 @@ class DownloadManager:
                 )
             samples = self._samples.setdefault(e.id, deque(maxlen=200))
             watch = self._watches.setdefault(e.id, self._slow_watch())
+            host = urllib.parse.urlsplit(url).netloc
+            if watch.fraction <= 0 and self._fractions.get(host):
+                watch.fraction = self._fractions[host]  # what earlier downloads learned
             done = have
-            watch.new_connection(time.time(), done)
+            cl = resp.headers.get("Content-Length", "")
+            length = int(cl) if cl.isdigit() else (max(total - have, 0) if code == 206 else 0)
+            watch.new_connection(time.time(), done, length)
+            if watch.fraction > 0:
+                self._fractions[host] = watch.fraction
             with open(part, mode) as f:
                 while True:
                     ctl.check()
@@ -761,6 +870,11 @@ class DownloadManager:
                         raise _Reconnect(
                             f"connection slowed down (best {watch.best / 1e6:.1f} MB/s), "
                             f"reconnecting (#{watch.reconnects})"
+                        )
+                    if watch.should_rotate(done) and (not total or done < total):
+                        raise _Reconnect(
+                            f"fast part of the response is spent ({watch.fraction:.0%} of "
+                            f"{length // 1024**2} MB), rotating (#{watch.rotations})"
                         )
         if total and done < total:
             return False

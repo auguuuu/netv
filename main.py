@@ -99,6 +99,7 @@ import downloads
 import epg
 import ffmpeg_command
 import ffmpeg_session
+import local_media
 
 
 log = logging.getLogger()
@@ -361,6 +362,16 @@ app = FastAPI(title="neTV", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    """Browsers ask for /favicon.ico regardless of the <link rel=icon> tag."""
+    return FileResponse(
+        APP_DIR / "static" / "favicon.svg",
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "max-age=86400"},
+    )
+
+
 class AuthRequired(Exception):
     """Raised when authentication is required."""
 
@@ -410,6 +421,8 @@ def require_admin(request: Request) -> dict:
 
 # Offline downloads: /api/downloads*, /downloads/files/{id}, /api/online (logic in downloads.py)
 app.include_router(downloads.build_router(require_auth))
+# Offline playback of finished downloads: /api/local/*, /local/* (logic in local_media.py)
+app.include_router(local_media.build_router(require_auth))
 
 
 # =============================================================================
@@ -514,11 +527,6 @@ async def logout():
 # =============================================================================
 # Main Pages
 # =============================================================================
-
-
-@app.get("/favicon.ico")
-async def favicon():
-    return Response(status_code=204)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1663,7 +1671,8 @@ async def player_download_page(
         {
             "raw_url": raw_url,
             "stream_id": entry.item_id,
-            "transcode_mode": "always",
+            "transcode_mode": "never",  # unused: local_download_id drives playback
+            "local_download_id": download_id,
             "live_dvr_mins": 0,
             "stream_type": "series" if is_episode else "movie",
             "channel_name": entry.title,

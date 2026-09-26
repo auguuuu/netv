@@ -98,13 +98,16 @@
     <!-- Loading indicator -->
     <div id="loading" class="absolute inset-0 flex items-center justify-center bg-black/50 z-20 pointer-events-none">
       <div class="animate-spin w-16 h-16 border-4 border-blue-500 border-t-transparent rounded-full"></div>
+      <span id="loading-label" class="absolute mt-32 text-sm text-gray-200 hidden"></span>
     </div>
 
     <!-- Error state -->
     <div id="error" class="absolute inset-0 flex items-center justify-center bg-black/80 hidden z-30">
       <div class="text-center">
-        <p class="text-2xl text-red-400 mb-4">Failed to load stream</p>
-        <button onclick="location.reload()" class="px-6 py-3 bg-blue-600 rounded-lg focusable" tabindex="0">Retry</button>
+        <p id="error-message" class="text-2xl text-red-400 mb-4">Failed to load stream</p>
+        <button id="error-retry" class="px-6 py-3 bg-blue-600 rounded-lg focusable" tabindex="0">Retry</button>
+        <a id="error-raw" href="#" class="hidden inline-block px-6 py-3 ml-2 bg-gray-700 rounded-lg focusable" tabindex="0">Ouvrir le fichier brut</a>
+        <button id="error-dismiss" class="px-6 py-3 ml-2 bg-gray-700 rounded-lg focusable hidden" tabindex="0">Back to video</button>
       </div>
     </div>
 
@@ -232,11 +235,13 @@ window.PLAYER_CONFIG = {
   castHost: {{ cast_host | tojson }},
   isHttps: {{ (request.url.scheme == 'https') | tojson }},
   deinterlaceFallback: {{ deinterlace_fallback | tojson }},
-  sourceId: {{ source_id | tojson }}
+  sourceId: {{ source_id | tojson }},
+  localDownloadId: {{ local_download_id | default(none) | tojson }}
 };
 </script>
 <script src="/static/js/player-quality.js"></script>
 <script src="/static/js/player-tracks.js"></script>
 <script src="/static/js/live-playback.js"></script>
+<script src="/static/js/local-playback.js"></script>
 <script src="/static/js/player.js"></script>
 {% endblock %}

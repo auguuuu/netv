@@ -50,6 +50,7 @@ from ffmpeg_command import (
     selectable_audio_streams,
 )
 from playback_policy import PlaybackHealth, PlaybackPolicy, UpgradePolicy
+from range_proxy import proxied_input_url, range_proxy_enabled
 from util import redact_url_credentials
 
 
@@ -66,6 +67,10 @@ _PLAYLIST_WAIT_SEEK_TIMEOUT_SEC = 40.0
 _REUSE_ACTIVE_WAIT_TIMEOUT_SEC = 15.0
 _RESUME_WAIT_TIMEOUT_SEC = 10.0
 _RESUME_SEGMENT_WAIT_TIMEOUT_SEC = 5.0
+# A seek gets a fresh ffmpeg when the previous attempt produced nothing in time
+# (a provider that stalls one HTTP request leaves ffmpeg waiting for headers).
+_SEEK_ATTEMPT_TIMEOUTS_SEC = (12.0, 20.0)
+_PROXIED_RW_TIMEOUT_US = 40_000_000
 
 # Size thresholds
 _MIN_SEGMENT_SIZE_BYTES = 1_000
@@ -74,6 +79,7 @@ _MIN_SEGMENT_SIZE_BYTES = 1_000
 _transcode_sessions: dict[str, dict[str, Any]] = {}
 _url_to_session: dict[str, str] = {}  # URL -> session_id (all content types)
 _transcode_lock = threading.Lock()
+_seek_generation: dict[str, int] = {}  # session_id -> newest seek request number
 _background_tasks: set[asyncio.Task[None]] = set()
 
 
@@ -254,12 +260,17 @@ def enforce_stream_limits(
     source_id: str | None,
     user_max: int,
     source_max: int,
+    spare_session_id: str | None = None,
 ) -> str | None:
     """Enforce stream limits, stopping oldest sessions if needed.
 
     Returns error message if source is at capacity and user can't reclaim,
-    or None if limits are satisfied.
+    or None if limits are satisfied.  `spare_session_id` is a session the
+    caller is about to reuse (it takes no new slot): it is never stopped, and
+    while it exists the caller's own slot is already counted.
     """
+    if spare_session_id and get_session(spare_session_id):
+        return None
     # Check source limit first (hard limit - can only reclaim own slots)
     if source_id and source_max > 0:
         source_sessions = get_source_sessions(source_id)
@@ -960,6 +971,8 @@ async def _do_start_transcode(
         cmd.insert(i_idx, str(old_seek_offset))
         cmd.insert(i_idx, "-ss")
         log.info("Applying seek_offset=%.1f from previous session", old_seek_offset)
+    if is_vod:
+        _route_through_range_proxy(cmd, settings)
 
     log.info(
         "Starting transcode session %s (vod=%s): %s",
@@ -993,6 +1006,7 @@ async def _do_start_transcode(
             "source_id": source_id,
             "bandwidth_saver": bandwidth_saver,
             "audio_tracks": audio_track_info,
+            "media_info": media_info,
             "playback_policy": PlaybackPolicy(bandwidth_saver=bandwidth_saver),
             "recovery_bitrate": live_video_bitrates(settings.get("max_resolution", "1080p"))[1]
             * 1.1,
@@ -1078,14 +1092,25 @@ async def start_transcode(
     """Start or reuse a transcode session."""
     if bandwidth_saver and content_type != "live":
         raise HTTPException(400, "Adaptive playback is only supported for live streams")
-    # Enforce stream limits
+    # Reloading the page (e.g. after a failed seek) reuses the user's own valid
+    # session for this URL: it takes no new slot and must not be stopped by the
+    # limit killer (that used to kill the session that was mid seek).
+    existing_id, is_valid, old_seek_offset = _get_existing_session(url)
+    spare_id = None
+    if existing_id and is_valid and not bandwidth_saver:
+        owner = get_session(existing_id)
+        if owner and owner.get("username") == username:
+            spare_id = existing_id
     if username:
-        error = enforce_stream_limits(username, source_id, user_max_streams, source_max_streams)
+        error = enforce_stream_limits(
+            username, source_id, user_max_streams, source_max_streams, spare_id
+        )
         if error:
             raise HTTPException(status_code=429, detail=error)
+        if not spare_id:
+            existing_id, is_valid, old_seek_offset = _get_existing_session(url)
 
     # A quality change replaces the current stream; release its slot first.
-    existing_id, is_valid, old_seek_offset = _get_existing_session(url)
     if bandwidth_saver and existing_id:
         session = get_session(existing_id)
         if session and session.get("username") != username:
@@ -1243,6 +1268,7 @@ class _SeekSessionInfo:
     series_id: int | None
     episode_id: int | None
     audio_tracks: list[dict[str, Any]] = field(default_factory=list)
+    media_info: MediaInfo | None = None
 
 
 def _get_seek_session_info(session_id: str) -> _SeekSessionInfo | None:
@@ -1259,6 +1285,7 @@ def _get_seek_session_info(session_id: str) -> _SeekSessionInfo | None:
             series_id=session.get("series_id"),
             episode_id=session.get("episode_id"),
             audio_tracks=session.get("audio_tracks") or [],
+            media_info=session.get("media_info"),
         )
 
 
@@ -1297,26 +1324,16 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
         _regenerate_playlist(output_path, segment_num)
         return {"session_id": session_id, "playlist": f"/transcode/{session_id}/stream.m3u8"}
 
+    # A newer seek on this session supersedes this one
+    my_gen = _seek_generation.get(session_id, 0) + 1
+    _seek_generation[session_id] = my_gen
+
     # Kill existing process
     if _kill_process(info.process):
         log.info("Killed ffmpeg for seek in session %s", session_id)
 
-    # Clear playlist but keep segments (for backward seeks later)
     playlist_file = output_path / "stream.m3u8"
-    playlist_file.unlink(missing_ok=True)
-    # Only clear segments AFTER target (we might seek back to earlier ones)
-    for seg_file in output_path.glob(f"{SEG_PREFIX}*.ts"):
-        try:
-            seg_num = int(seg_file.stem[len(SEG_PREFIX) :])
-            if seg_num >= segment_num:
-                seg_file.unlink(missing_ok=True)
-        except ValueError:
-            pass
-    for vtt_file in output_path.glob("sub*.vtt"):
-        vtt_file.unlink(missing_ok=True)
-    # Alternate audio renditions restart from the seek point: drop them entirely
-    for audio_file in [*output_path.glob("a[0-9]*.m3u8"), *output_path.glob("a[0-9]*_*.ts")]:
-        audio_file.unlink(missing_ok=True)
+    _clear_seek_output(output_path, segment_num)
 
     # Resolve HLS master playlist to highest bandwidth variant
     url = await asyncio.to_thread(resolve_hls_master_playlist, info.url)
@@ -1324,7 +1341,12 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
     # Use probe_series if series_id, else probe_movies
     probe_setting = "probe_series" if info.series_id else "probe_movies"
     do_probe = settings.get(probe_setting, False)
-    if do_probe:
+    media_info: MediaInfo | None
+    if info.media_info is not None:
+        # Probed when the session started: probing again on every seek costs
+        # several extra provider connections before ffmpeg even starts
+        media_info = info.media_info
+    elif do_probe:
         media_info = (
             await asyncio.to_thread(
                 probe_media,
@@ -1333,6 +1355,9 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
                 info.episode_id,
             )
         )[0]
+        with _transcode_lock:
+            if session_id in _transcode_sessions:
+                _transcode_sessions[session_id]["media_info"] = media_info
     else:
         media_info = None
 
@@ -1383,39 +1408,61 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
         cmd.insert(f_idx, "-output_ts_offset")
     cmd.extend(["-start_number", str(segment_num)])
 
+    _route_through_range_proxy(cmd, settings)
+
     log.info(
         "Seek transcode %s to %.1fs (seg %d): %s",
         session_id,
         seek_time,
         segment_num,
-        " ".join(cmd),
+        " ".join(redact_url_credentials(arg) for arg in cmd),
     )
 
-    process = await _launch_ffmpeg(cmd)
+    for attempt, wait_sec in enumerate(_SEEK_ATTEMPT_TIMEOUTS_SEC, start=1):
+        touch_session(session_id)  # a seek in progress is a live session
+        if attempt > 1:
+            _clear_seek_output(output_path, segment_num)
+        process = await _launch_ffmpeg(cmd)
 
-    if not _update_session_process(session_id, process, url=info.url, seek_time=seek_time):
+        if not _update_session_process(session_id, process, url=info.url, seek_time=seek_time):
+            _kill_process(process)
+            raise HTTPException(404, "Session disappeared during seek")
+
+        if attempt == 1:
+            # Persist seek_offset
+            session_json = output_path / "session.json"
+            if session_json.exists():
+                try:
+                    data = json.loads(session_json.read_text())
+                    data["seek_offset"] = seek_time
+                    session_json.write_text(json.dumps(data))
+                except Exception as e:
+                    log.warning("Failed to update session.json for %s: %s", session_id, e)
+
+        _spawn_background_task(_monitor_seek_ffmpeg(process, session_id))
+
+        if await _wait_for_playlist(
+            playlist_file,
+            process,
+            min_segments=2,
+            timeout_sec=wait_sec,
+        ):
+            break
+        if _seek_generation.get(session_id) != my_gen:
+            # A newer seek owns the session's ffmpeg now: leave it alone
+            raise HTTPException(409, "Seek superseded by a newer seek")
+        log.warning(
+            "Seek to %.1fs in session %s: no playlist after %.0fs (attempt %d/%d)%s",
+            seek_time,
+            session_id,
+            wait_sec,
+            attempt,
+            len(_SEEK_ATTEMPT_TIMEOUTS_SEC),
+            ", retrying with a fresh ffmpeg" if attempt < len(_SEEK_ATTEMPT_TIMEOUTS_SEC) else "",
+        )
         _kill_process(process)
-        raise HTTPException(404, "Session disappeared during seek")
-
-    # Persist seek_offset
-    session_json = output_path / "session.json"
-    if session_json.exists():
-        try:
-            data = json.loads(session_json.read_text())
-            data["seek_offset"] = seek_time
-            session_json.write_text(json.dumps(data))
-        except Exception as e:
-            log.warning("Failed to update session.json for %s: %s", session_id, e)
-
-    _spawn_background_task(_monitor_seek_ffmpeg(process, session_id))
-
-    if not await _wait_for_playlist(
-        playlist_file,
-        process,
-        min_segments=2,
-        timeout_sec=_PLAYLIST_WAIT_TIMEOUT_SEC,
-    ):
-        raise HTTPException(500, "Seek transcode timed out waiting for playlist")
+    else:
+        raise HTTPException(504, "The stream did not answer in time, please retry the seek")
 
     log.info("Seek ready: %s", playlist_file)
 
@@ -1424,6 +1471,40 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
         "segment": segment_num,
         "time": seek_time,
     }
+
+
+def _route_through_range_proxy(cmd: list[str], settings: dict[str, Any]) -> None:
+    """Point ffmpeg's input at the local range proxy when it is enabled."""
+    if not range_proxy_enabled(settings):
+        return
+    i_idx = cmd.index("-i") + 1
+    local = proxied_input_url(cmd[i_idx])
+    if local == cmd[i_idx]:
+        return
+    cmd[i_idx] = local
+    if "-rw_timeout" in cmd:
+        # The proxy has its own upstream timeouts and retries; let it finish them
+        cmd[cmd.index("-rw_timeout") + 1] = str(_PROXIED_RW_TIMEOUT_US)
+
+
+def _clear_seek_output(output_path: pathlib.Path, segment_num: int) -> None:
+    """Drop the playlist and everything from the seek target on.
+
+    Segments before the target stay (we might seek back to earlier ones).
+    """
+    (output_path / "stream.m3u8").unlink(missing_ok=True)
+    for seg_file in output_path.glob(f"{SEG_PREFIX}*.ts"):
+        try:
+            seg_num = int(seg_file.stem[len(SEG_PREFIX) :])
+            if seg_num >= segment_num:
+                seg_file.unlink(missing_ok=True)
+        except ValueError:
+            pass
+    for vtt_file in output_path.glob("sub*.vtt"):
+        vtt_file.unlink(missing_ok=True)
+    # Alternate audio renditions restart from the seek point: drop them entirely
+    for audio_file in [*output_path.glob("a[0-9]*.m3u8"), *output_path.glob("a[0-9]*_*.ts")]:
+        audio_file.unlink(missing_ok=True)
 
 
 def report_playback_health(

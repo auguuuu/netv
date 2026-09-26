@@ -947,6 +947,9 @@ def probe_media(
 # ===========================================================================
 
 
+VOD_HTTP_RW_TIMEOUT_US = 8_000_000
+
+
 def http_reconnect_args(url: str, *, max_delay: int = 30) -> list[str]:
     """HTTP reconnect options must not be passed to local or other protocol inputs."""
     if not url.startswith(("http://", "https://")):
@@ -1477,6 +1480,10 @@ def build_hls_ffmpeg_cmd(
         ]
     )
     cmd.extend(http_reconnect_args(input_url))
+    if is_vod and input_url.startswith(("http://", "https://")):
+        # Without a timeout ffmpeg waits forever for the headers of a request the
+        # provider never answers; with one, -reconnect opens a fresh connection.
+        cmd.extend(["-rw_timeout", str(VOD_HTTP_RW_TIMEOUT_US)])
     if user_agent and input_url.startswith(("http://", "https://")):
         # -user_agent is an http protocol option: ffmpeg rejects it for local files
         cmd.extend(["-user_agent", user_agent])

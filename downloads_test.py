@@ -34,6 +34,11 @@ class FakeProvider:
         self.ignore_range = False
         self.slow_after: int | None = None  # first connection only: throttle after N bytes
         self.slow_delay = 0.1
+        self.chunk = 50_000
+        self.burst_frac: float | None = (
+            None  # every response: fast for this share of it, then throttled
+        )
+        self.slow_bytes = 0  # bytes served in the throttled phase (all connections)
         self.status_override: int | None = None
         self.content_type = "video/x-matroska"
         provider = self
@@ -75,16 +80,22 @@ class FakeProvider:
                     provider.slow_after = None  # only the first connection is throttled
                 try:
                     while sent < len(body):
-                        n = min(50_000, len(body) - sent)
+                        n = min(provider.chunk, len(body) - sent)
                         if limit is not None and sent + n > limit:
                             self.wfile.write(body[sent : sent + (limit - sent)])
                             self.wfile.flush()
                             self.close_connection = True
                             self.connection.shutdown(socket.SHUT_RDWR)
                             return
+                        throttled = provider.burst_frac is not None and sent >= (
+                            provider.burst_frac * len(body)
+                        )
                         self.wfile.write(body[sent : sent + n])
                         self.wfile.flush()
                         sent += n
+                        if throttled:
+                            provider.slow_bytes += n
+                            time.sleep(provider.slow_delay)
                         if provider.delay:
                             time.sleep(provider.delay)
                         if slow_after is not None and sent >= slow_after:
@@ -607,6 +618,117 @@ def test_slow_connection_is_replaced_and_file_stays_intact(
     hits = [r for _, r in provider.hits]
     assert len(hits) >= 2 and hits[0] is None
     assert hits[1] and hits[1].startswith("bytes=") and hits[1] != "bytes=0-"
+
+
+def _conn(w: SlowWatch, now: float, done: float, length: int) -> None:
+    w.new_connection(now, int(done), length)
+
+
+def _run_conn(
+    w: SlowWatch,
+    now: float,
+    done: float,
+    length: int,
+    fast_rate: float,
+    burst: float,
+    slow_rate: float,
+) -> tuple[float, float, str]:
+    """Simulate one connection sampled every 0.1 s. Returns (now, done, why it ended)."""
+    _conn(w, now, done, length)
+    start = done
+    while done - start < length:
+        now += 0.1
+        rate = fast_rate if done - start < burst else slow_rate
+        done += min(rate * 0.1, length - (done - start))
+        if w.feed(now, int(done)):
+            return now, done, "slow"
+        if w.should_rotate(int(done)):
+            return now, done, "rotate"
+    return now, done, "eof"
+
+
+def test_slowwatch_learns_burst_fraction_then_rotates_before_the_throttle() -> None:
+    w = SlowWatch(window=1, patience=3, fast_enough=1e12, min_burst=1_000_000)
+    total = 600_000_000
+    now, done, why = _run_conn(w, 0, 0, total, 30e6, 0.15 * total, 1e6)
+    assert why == "slow" and w.fraction == 0  # nothing known yet, the watchdog does the job
+    now, done, why = _run_conn(w, now, done, total - int(done), 30e6, 0.15 * (total - done), 1e6)
+    assert why == "rotate" and 0.12 <= w.fraction <= 0.2  # learned from the first knee
+    for _ in range(5):  # every next connection is cut right before its throttle starts
+        length = total - int(done)
+        start = done
+        now, done, why = _run_conn(w, now, done, length, 30e6, 0.15 * length, 1e6)
+        assert why == "rotate"
+        assert 0.10 * length <= done - start <= 0.155 * length
+    assert w.rotations >= 5
+
+
+def test_slowwatch_rotation_guards() -> None:
+    w = SlowWatch(burst_fraction=0.15, min_burst=4_000_000)
+    _conn(w, 0, 0, 0)  # unknown length: never rotate
+    assert not w.should_rotate(10**9)
+    _conn(w, 0, 0, 20_000_000)  # 15 % of 20 MB is 3 MB, below min_burst
+    assert not w.should_rotate(3_000_000)
+    _conn(w, 0, 0, 100_000_000)
+    assert not w.should_rotate(10_000_000)  # burst not spent yet
+    assert w.should_rotate(15_000_000)
+    off = SlowWatch(burst_fraction=0.15, rotate=False)
+    _conn(off, 0, 0, 100_000_000)
+    assert not off.should_rotate(50_000_000)
+    unknown = SlowWatch()  # provider that never throttles: fraction stays unknown
+    _conn(unknown, 0, 0, 100_000_000)
+    for i in range(1, 30):
+        assert not unknown.feed(i, i * 10_000_000)
+    assert not unknown.should_rotate(300_000_000) and unknown.fraction == 0
+
+
+def test_slowwatch_corrects_a_fraction_that_is_too_optimistic() -> None:
+    w = SlowWatch(window=1, patience=3, fast_enough=1e12, burst_fraction=0.3, min_burst=1_000_000)
+    total = 600_000_000
+    # the real burst is 15 %: the planned cut (28 %) comes after the throttle started
+    now, done, why = _run_conn(w, 0, 0, total, 30e6, 0.15 * total, 1e6)
+    assert why == "slow"
+    _conn(w, now, done, total - int(done))
+    assert 0.12 <= w.fraction <= 0.2
+
+
+def _burst_run(
+    tmp_path: Path, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch, rotate: bool
+) -> tuple[DownloadManager, Any]:
+    monkeypatch.setattr(downloads, "CHUNK_SIZE", 5_000)
+    provider.chunk = 5_000
+    provider.burst_frac = 0.3
+    provider.slow_delay = 0.03
+    provider.slow_bytes = 0
+    provider.hits.clear()
+    mgr = make_manager(
+        tmp_path / str(rotate),
+        provider,
+        slow_watch=lambda: SlowWatch(
+            window=0.05,
+            patience=0.3,
+            fast_enough=1e12,
+            knee_window=0.03,
+            min_burst=20_000,
+            rotate=rotate,
+        ),
+    )
+    e = mgr.add("movie", "1", title="Burst")
+    wait_for(lambda: e.status == "done", timeout=60)
+    assert (mgr.dir / e.filename).read_bytes() == DATA
+    return mgr, e
+
+
+def test_burst_limited_provider_is_rotated_and_file_intact(
+    tmp_path: Path, provider: FakeProvider, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _ = _burst_run(tmp_path, provider, monkeypatch, rotate=False)
+    plain_slow, plain_hits = provider.slow_bytes, len(provider.hits)
+    mgr, _ = _burst_run(tmp_path, provider, monkeypatch, rotate=True)
+    assert len(provider.hits) >= 4 and plain_hits >= 2  # first connection, then rotations
+    # rotation stops each connection right before its throttle starts
+    assert provider.slow_bytes < 0.5 * plain_slow
+    assert mgr._fractions  # learned fraction remembered per provider host
 
 
 def test_part_file_already_complete_is_finished_not_deleted(

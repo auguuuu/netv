@@ -89,7 +89,61 @@
     return languageName(track.lang) || languageName(track.name) || String(track.lang || '').toLowerCase();
   }
 
-  const api = { languageName, trackLabel, findAudioByLang, langKey };
+  const trackText = (t) => `${t.name || ''} ${t.label || ''}`;
+
+  // Subtitle track meant for deaf / hard of hearing viewers (SDH, CC, HI...).
+  function isSdh(track) {
+    return /\bsdh\b|\bhoh\b|\bhi\b|\bcc\b|hearing|deaf|closed.?caption|malentendant|sourds/i.test(trackText(track));
+  }
+
+  // Forced subtitles only translate foreign dialogue, not what we want by default.
+  function isForced(track) {
+    return /forc|forced/i.test(trackText(track));
+  }
+
+  // Track flagged as the original version by its name (e.g. "English (Original)", "VO").
+  function isOriginal(track) {
+    return /\boriginal\b|\borig\.|\bv\.?o\.?\b|\bo\.?v\.?\b/i.test(trackText(track));
+  }
+
+  // Default audio track index. Order: language the user picked last
+  // (opts.preferred), original language (opts.original, or a track named
+  // "original"), English, French, then the first track. -1 when there are no tracks.
+  function pickDefaultAudio(tracks, opts) {
+    if (!tracks || tracks.length === 0) return -1;
+    const o = opts || {};
+    let idx = findAudioByLang(tracks, o.preferred);
+    if (idx >= 0) return idx;
+    idx = findAudioByLang(tracks, o.original);
+    if (idx >= 0) return idx;
+    idx = tracks.findIndex(isOriginal);
+    if (idx >= 0) return idx;
+    idx = findAudioByLang(tracks, 'Anglais');
+    if (idx >= 0) return idx;
+    idx = findAudioByLang(tracks, 'Français');
+    return idx >= 0 ? idx : 0;
+  }
+
+  // Track to show when the user turns subtitles on: English SDH, else any
+  // English (not forced), else French SDH, else French, else the first one.
+  // Returns -1 when there are no tracks.
+  function pickDefaultSubtitle(tracks) {
+    if (!tracks || tracks.length === 0) return -1;
+    for (const lang of ['Anglais', 'Français']) {
+      const same = tracks
+        .map((t, i) => ({ t, i }))
+        .filter(({ t }) => (languageName(t.lang) || languageName(t.name)) === lang && !isForced(t));
+      const sdh = same.find(({ t }) => isSdh(t));
+      if (sdh) return sdh.i;
+      if (same.length > 0) return same[0].i;
+    }
+    return 0;
+  }
+
+  const api = {
+    languageName, trackLabel, findAudioByLang, langKey,
+    isSdh, isForced, isOriginal, pickDefaultAudio, pickDefaultSubtitle,
+  };
   root.NetvTracks = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof window !== 'undefined' ? window : globalThis);

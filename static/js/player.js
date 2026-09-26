@@ -14,6 +14,7 @@
   const audioMenu = document.getElementById('audio-menu');
   const ccMenu = document.getElementById('cc-menu');
   const Tracks = window.NetvTracks;
+  const Local = window.NetvLocal;
   const AUDIO_LANG_KEY = 'playerAudioLang';
 
   // State
@@ -110,10 +111,13 @@
     loading.classList.remove('hidden');
   }
 
-  function showError() {
+  function showError(message, canDismiss) {
     adaptivePlayback?.destroy();
     adaptivePlayback = null;
     hideLoading();
+    const text = document.getElementById('error-message');
+    if (text) text.textContent = message || 'Failed to load stream';
+    document.getElementById('error-dismiss')?.classList.toggle('hidden', !canDismiss);
     error.classList.remove('hidden');
   }
 
@@ -258,7 +262,14 @@
   }
 
   function getPreferredSubtitleTrack(tracks) {
+    // Explicit pick in the CC menu stays across seeks
+    if (ccSelectedIdx !== null && ccSelectedIdx < tracks.length) return ccSelectedIdx;
     const prefLang = cfg.ccLang || '';
+    if (!prefLang && tracks.length > 0) {
+      // No configured language: English SDH, else English, else French
+      const idx = Tracks.pickDefaultSubtitle(tracks.map(t => ({ lang: t.lang || t.language, name: t.name || t.label })));
+      return idx >= 0 ? idx : 0;
+    }
     if (!prefLang || tracks.length === 0) return 0;
     // Handle CC1-CC4 (CEA-608 channels)
     if (/^cc[1-4]$/i.test(prefLang)) {
@@ -628,6 +639,8 @@
       currentHls.destroy();
       currentHls = null;
     }
+    stopSeekWait();
+    failedSeekTarget = null;
     transcodedDuration = 0;
     totalDuration = 0;
     seekInProgress = false;
@@ -660,65 +673,142 @@
     transcodeSessionId = null;
   }
 
+  // Streamed seeks restart ffmpeg on the server, which can take a while (or stall
+  // on the provider side). The newest click wins, the old picture stays on screen
+  // until the new stream is ready, and a failure can be retried in place.
+  const SEEK_DEBOUNCE_MS = 200;
+  const SEEK_CLIENT_RETRIES = 1;
+  let seekRequestId = 0;
+  let seekAbort = null;
+  let failedSeekTarget = null;
+
+  function showSeekStatus(text) {
+    const label = document.getElementById('loading-label');
+    if (!label) return;
+    label.textContent = text || '';
+    label.classList.toggle('hidden', !text);
+  }
+
+  function seekDelay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // Ask the server to restart at targetTime; one automatic retry on failure
+  // (the server already retries with a fresh ffmpeg before answering 504).
+  async function requestSeekOnServer(targetTime, signal) {
+    let lastError = null;
+    for (let attempt = 0; attempt <= SEEK_CLIENT_RETRIES; attempt++) {
+      try {
+        const resp = await fetch('/transcode/seek/' + transcodeSessionId + '?time=' + targetTime, {signal});
+        if (resp.ok) return;
+        lastError = new Error('Seek failed: ' + resp.status);
+        // session gone or replaced by a newer seek: retrying cannot help
+        if (resp.status === 404 || resp.status === 409 || resp.status === 401) break;
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        lastError = e;
+      }
+      if (attempt < SEEK_CLIENT_RETRIES) {
+        showSeekStatus('Retrying...');
+        await seekDelay(400);
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      }
+    }
+    throw lastError;
+  }
+
+  function stopSeekWait() {
+    seekRequestId++;
+    if (seekAbort) {
+      seekAbort.abort();
+      seekAbort = null;
+    }
+  }
+
   async function handleSeekToPosition(targetTime) {
-    if (!transcodeSessionId || seekInProgress) return false;
+    if (!transcodeSessionId) return false;
+    // Whole seconds: the clicked pixel has no finer meaning, and it keeps
+    // repeated seeks to the same spot identical for the server's segment reuse.
+    targetTime = Math.max(0, Math.floor(targetTime));
+    stopSeekWait();
+    const myId = seekRequestId;
+    const abort = new AbortController();
+    seekAbort = abort;
     seekInProgress = true;
+    failedSeekTarget = null;
     showLoading();
+    showSeekStatus('Seeking...');
     error.classList.add('hidden');
     video.pause();
-    video.src = '';
+    // Keep the last picture: only stop the old stream from loading while we wait
+    currentHls?.stopLoad();
     if (subtitlePollTimerId) {
       clearInterval(subtitlePollTimerId);
       clearTimeout(subtitlePollTimerId);
       subtitlePollTimerId = null;
     }
+    try {
+      await seekDelay(SEEK_DEBOUNCE_MS);
+      if (myId !== seekRequestId) return false;
+      await requestSeekOnServer(targetTime, abort.signal);
+    } catch (e) {
+      if (myId !== seekRequestId) return false; // a newer seek took over
+      console.error('[SEEK] Error:', e);
+      seekInProgress = false;
+      failedSeekTarget = targetTime;
+      showSeekStatus('');
+      showError('Seek failed', true);
+      return false;
+    }
+    if (myId !== seekRequestId) return false;
+    seekAbort = null;
+    showSeekStatus('');
+    video.src = '';
     if (currentHls) {
       currentHls.destroy();
       currentHls = null;
     }
-    try {
-      const resp = await fetch('/transcode/seek/' + transcodeSessionId + '?time=' + targetTime);
-      if (!resp.ok) throw new Error('Seek failed: ' + resp.status);
-      transcodedDuration = 0;
-      seekOffset = targetTime;
-      const hls = new Hls(createHlsConfig({forSeek: true}));
-      currentHls = hls;
+    transcodedDuration = 0;
+    seekOffset = targetTime;
+    const hls = new Hls(createHlsConfig({forSeek: true}));
+    currentHls = hls;
+    wireTrackPrefs(hls); // a new hls.js instance starts on the default audio: re-apply the language
 
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        hideLoading();
-        error.classList.add('hidden');
-        seekInProgress = false;
-        savePosition();
-        if (currentSubtitles && currentSubtitles.length > 0) {
-          startSubtitlePolling(currentSubtitles, getPreferredSubtitleTrack(currentSubtitles));
-        }
-        video.play().catch(() => {});
-      });
-
-      let recoveryAttempts = 0;
-      hls.on(Hls.Events.ERROR, (event, data) => {
-        if (data.fatal) {
-          recoveryAttempts++;
-          if (recoveryAttempts <= 3) {
-            if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
-            else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
-            else { console.error('[SEEK] HLS error:', data); showError(); }
-          } else {
-            console.error('[SEEK] HLS error after retries:', data);
-            showError();
-          }
-        }
-      });
-
-      hls.loadSource('/transcode/' + transcodeSessionId + '/stream.m3u8');
-      hls.attachMedia(video);
-      return true;
-    } catch (e) {
-      console.error('[SEEK] Error:', e);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      hideLoading();
+      error.classList.add('hidden');
       seekInProgress = false;
-      showError();
-      return false;
-    }
+      savePosition();
+      if (currentSubtitles && currentSubtitles.length > 0) {
+        startSubtitlePolling(currentSubtitles, getPreferredSubtitleTrack(currentSubtitles));
+      }
+      video.play().catch(() => {});
+    });
+
+    let recoveryAttempts = 0;
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      if (!data.fatal) return;
+      recoveryAttempts++;
+      if (recoveryAttempts <= 3) {
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+        else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+        else failSeekPlayback(targetTime, data);
+      } else {
+        failSeekPlayback(targetTime, data);
+      }
+    });
+
+    hls.loadSource('/transcode/' + transcodeSessionId + '/stream.m3u8');
+    hls.attachMedia(video);
+    return true;
+  }
+
+  function failSeekPlayback(targetTime, data) {
+    console.error('[SEEK] HLS error:', data);
+    // A stuck flag used to swallow every later seek after a fatal error
+    seekInProgress = false;
+    failedSeekTarget = targetTime;
+    showError('Seek failed', true);
   }
 
   async function startTranscode(onError) {
@@ -864,18 +954,7 @@
       }, 1000);
     });
 
-    let audioAutoSelected = false;
-    const onAudioTracks = () => {
-      if (!audioAutoSelected && hls.audioTracks?.length > 1) {
-        audioAutoSelected = true;
-        const idx = Tracks.findAudioByLang(hls.audioTracks, loadSavedAudioLang());
-        if (idx >= 0 && idx !== hls.audioTrack) hls.audioTrack = idx;
-      }
-      updateAudioButton();
-    };
-    hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, onAudioTracks);
-    hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, () => updateAudioButton());
-    hls.on(Hls.Events.MANIFEST_PARSED, onAudioTracks);
+    wireTrackPrefs(hls);
 
     hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, () => {
       refreshOpenMenu();
@@ -946,12 +1025,38 @@
     return Object.keys(TRACK_MENUS).find(k => TRACK_MENUS[k].menu.classList.contains('open')) || null;
   }
 
+  // Language picked in this page (kept in memory too, so it survives seeks even without storage)
+  let sessionAudioLang = '';
+
   function loadSavedAudioLang() {
+    if (sessionAudioLang) return sessionAudioLang;
     try { return localStorage.getItem(AUDIO_LANG_KEY) || ''; } catch { return ''; }
   }
 
   function saveAudioLang(lang) {
+    sessionAudioLang = lang;
     try { localStorage.setItem(AUDIO_LANG_KEY, lang); } catch { /* storage unavailable */ }
+  }
+
+  // Audio choice for one hls.js instance. Seeks create a new instance that starts on the
+  // manifest default, so this runs again after every seek. Order: language picked last,
+  // original language, English, French, first track.
+  function wireTrackPrefs(hls) {
+    let applied = false;
+    const apply = () => {
+      if (!applied && hls.audioTracks?.length > 1) {
+        applied = true;
+        const idx = Tracks.pickDefaultAudio(hls.audioTracks, {
+          preferred: loadSavedAudioLang(),
+          original: cfg.originalLang,
+        });
+        if (idx >= 0 && idx !== hls.audioTrack) hls.audioTrack = idx;
+      }
+      updateAudioButton();
+    };
+    hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, apply);
+    hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, () => updateAudioButton());
+    hls.on(Hls.Events.MANIFEST_PARSED, apply);
   }
 
   // Audio tracks from hls.js, or from the native API (Safari) as a fallback.
@@ -1048,6 +1153,14 @@
     }
     updateCcButton();
     saveSettings({ ccEnabled });
+  }
+
+  // Shift+C: turn subtitles off, or on with the default track (English SDH, else English, else French).
+  function toggleDefaultCaptions() {
+    if (ccBtn.disabled) return;
+    if (ccEnabled && getActiveCcIdx() >= 0) { setCcTrack(-1); return; }
+    const idx = Tracks.pickDefaultSubtitle(getCcTracks());
+    if (idx >= 0) setCcTrack(idx);
   }
 
   function menuEntries(kind) {
@@ -1200,6 +1313,7 @@
         case 'm': video.muted = !video.muted; updateMuteIcon(); break;
         case 't': document.getElementById('menu-transcode')?.click(); break;
         case 'c': if (!ccBtn.disabled) ccBtn.click(); break;
+        case 'C': toggleDefaultCaptions(); break; // Shift+C: subtitles on (English SDH) / off
         case 'l': if (!audioBtn.classList.contains('hidden')) audioBtn.click(); break;
         case 'i': document.getElementById('info-btn')?.click(); break;
         case 'd': {
@@ -1509,6 +1623,19 @@
       if (e.key === ' ') e.preventDefault();
     });
 
+    // Retry re-seeks to the same spot after a failed seek instead of reloading the page
+    document.getElementById('error-retry')?.addEventListener('click', () => {
+      if (failedSeekTarget !== null && transcodeSessionId) {
+        handleSeekToPosition(failedSeekTarget);
+      } else {
+        location.reload();
+      }
+    });
+    document.getElementById('error-dismiss')?.addEventListener('click', () => {
+      error.classList.add('hidden');
+      hideLoading();
+    });
+
     // Progress bar
     const progressBar = document.getElementById('progress-bar');
 
@@ -1561,6 +1688,7 @@
         return;
       }
       seekContainer.classList.add('hidden');
+      if (cfg.localDownloadId) { video.currentTime = targetTime; return; }
       const actualTranscodedEnd = seekOffset + transcodedDuration;
       if (targetTime >= seekOffset && targetTime <= actualTranscodedEnd + 10) {
         video.currentTime = targetTime - seekOffset;
@@ -1704,13 +1832,269 @@
     });
   }
 
+  // ============================================================
+  // Local download playback (finished offline downloads)
+  // ============================================================
+  // A finished download is a local file, so playback never goes through /transcode/*.
+  // The server describes the file (/api/local/{id}/plan); the player then plays the raw
+  // file when the browser can, else a COMPLETE VOD HLS playlist whose segments the server
+  // cuts on demand. Either way seeking is a plain video.currentTime change: no session,
+  // no restart, no server round trip beyond the segment fetch. When a way fails the next
+  // one is tried automatically (see NetvLocal.chooseModes).
+
+  let localModes = [];
+  let localModeIdx = -1;
+  let localToken = 0;
+  let localAbort = null;
+  let localWatchdog = null;
+  let localResume = 0;
+  let localSubtitleTimers = [];
+
+  function showLocalError(message) {
+    const raw = document.getElementById('error-raw');
+    if (raw) {
+      raw.href = '/downloads/files/' + encodeURIComponent(cfg.localDownloadId);
+      raw.classList.remove('hidden');
+    }
+    showSeekStatus('');
+    showError(message, false);
+  }
+
+  function teardownLocalMode() {
+    clearTimeout(localWatchdog);
+    localWatchdog = null;
+    if (localAbort) localAbort.abort();
+    localAbort = null;
+    if (currentHls) {
+      currentHls.destroy();
+      currentHls = null;
+    }
+    video.removeAttribute('src');
+    video.load();
+  }
+
+  // The current way of playing failed: remember where we were and try the next one.
+  function failLocalMode(reason) {
+    console.warn('[LOCAL] ' + JSON.stringify(localModes[localModeIdx]) + ' failed: ' + reason);
+    const at = video.currentTime > 5 ? video.currentTime : localResume;
+    teardownLocalMode();
+    localModeIdx++;
+    if (localModeIdx >= localModes.length) {
+      showLocalError('Ce fichier ne peut pas être lu dans le navigateur.');
+      return;
+    }
+    startLocalMode(localModes[localModeIdx], at);
+  }
+
+  function playAfterLoad() {
+    video.play().catch(() => {
+      if (!video.muted) { autoMutedByPolicy = true; video.muted = true; }
+      video.play().catch(() => {});
+    });
+  }
+
+  function startLocalMode(mode, resume) {
+    const token = ++localToken;
+    localResume = resume;
+    const ac = new AbortController();
+    localAbort = ac;
+    const fail = (why) => { if (token === localToken) failLocalMode(why); };
+    const ready = () => {
+      clearTimeout(localWatchdog);
+      hideLoading();
+      showSeekStatus('');
+      error.classList.add('hidden');
+    };
+    showLoading();
+    showSeekStatus(mode.kind === 'hls' ? 'Préparation de la lecture locale…' : '');
+
+    const playNative = (timeoutMs) => {
+      video.src = mode.url;
+      video.addEventListener('loadedmetadata', () => {
+        ready();
+        if (resume > 0 && resume < (video.duration || Infinity)) video.currentTime = resume;
+        setupNativeAudioTracks();
+        playAfterLoad();
+      }, { once: true, signal: ac.signal });
+      video.addEventListener('error', () => {
+        fail('media error ' + (video.error ? video.error.code : '?'));
+      }, { signal: ac.signal });
+      localWatchdog = setTimeout(() => fail('timeout'), timeoutMs);
+    };
+
+    if (mode.kind === 'direct') {
+      playNative(15000);
+      return;
+    }
+    if (!(window.Hls && Hls.isSupported())) {
+      if (video.canPlayType('application/vnd.apple.mpegurl')) playNative(30000);
+      else fail('no HLS support');
+      return;
+    }
+    const hls = new Hls({
+      ...createHlsConfig({ isVod: true }),
+      startPosition: resume > 0 ? resume : 0,
+      enableCEA708Captions: false,
+      maxBufferLength: 45,
+      backBufferLength: 90,
+      manifestLoadingMaxRetry: 2,
+      levelLoadingMaxRetry: 2,
+      fragLoadingMaxRetry: 4,
+      fragLoadingRetryDelay: 500,
+    });
+    currentHls = hls;
+    wireTrackPrefs(hls);
+    let recoveries = 0;
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      ready();
+      playAfterLoad();
+    });
+    hls.on(Hls.Events.FRAG_BUFFERED, () => { recoveries = 0; });
+    hls.on(Hls.Events.ERROR, (event, data) => {
+      if (!data.fatal || token !== localToken) return;
+      recoveries++;
+      // A playlist that cannot load is not worth retrying (it is local): next way. A segment can be.
+      if (recoveries <= 2 && data.type === Hls.ErrorTypes.NETWORK_ERROR && /^frag/.test(data.details)) hls.startLoad();
+      else if (recoveries <= 2 && data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+      else fail('hls ' + data.details);
+    });
+    hls.loadSource(mode.url);
+    hls.attachMedia(video);
+    localWatchdog = setTimeout(() => fail('timeout'), 30000);
+  }
+
+  // Text subtitles are complete WebVTT files (not part of the HLS), loaded the first time
+  // a track is shown, so the CC menu works the same for the raw file and for HLS.
+  function setupLocalSubtitles(plan) {
+    const entries = Local.subtitleEntries(plan);
+    if (entries.length === 0) {
+      disableCcButton();
+      return;
+    }
+    activeTrackStates = entries.map((s) => ({
+      url: s.url,
+      track: video.addTextTrack('subtitles', s.label, s.lang),
+      addedCues: new Set(),
+      retryCount: 0,
+      loaded: false,
+    }));
+    activeTrackStates.forEach((ts) => { ts.track.mode = 'hidden'; });
+    enableCcButton();
+    const load = async (ts) => {
+      if (ts.loaded) return;
+      ts.loaded = true;
+      try {
+        const resp = await fetch(ts.url);
+        if (!resp.ok) throw new Error('subtitles ' + resp.status);
+        for (const cue of parseVttCues(await resp.text())) {
+          try { ts.track.addCue(new VTTCue(cue.start, cue.end, cue.text)); } catch (e) { /* bad cue */ }
+        }
+      } catch (e) {
+        console.warn('[LOCAL] subtitles failed:', e);
+        ts.loaded = false;
+        if (++ts.retryCount <= 3) {
+          localSubtitleTimers.push(setTimeout(() => { if (ts.track.mode === 'showing') load(ts); }, 4000));
+        }
+      }
+    };
+    video.textTracks.addEventListener('change', () => {
+      activeTrackStates.forEach((ts) => { if (ts.track.mode === 'showing') load(ts); });
+    });
+    if (ccEnabled) {
+      const idx = getPreferredSubtitleTrack(entries);
+      if (idx >= 0) setCcTrack(idx);
+    }
+  }
+
+  // Click, drag and keyboard scrubbing: plain currentTime writes, coalesced while dragging.
+  function setupLocalScrub() {
+    const bar = document.getElementById('progress-bar');
+    if (!bar) return;
+    let dragging = false;
+    let pending = null;
+    let timer = null;
+    const timeAt = (e) => {
+      const rect = bar.getBoundingClientRect();
+      const pct = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+      return pct * (totalDuration || video.duration || 0);
+    };
+    const apply = () => {
+      timer = null;
+      if (pending !== null && Number.isFinite(pending)) video.currentTime = pending;
+      pending = null;
+      updateProgress();
+    };
+    const schedule = (e) => {
+      pending = timeAt(e);
+      if (!timer) timer = setTimeout(apply, 120);
+    };
+    bar.addEventListener('pointerdown', (e) => {
+      if (!(totalDuration || video.duration)) return;
+      dragging = true;
+      try { bar.setPointerCapture(e.pointerId); } catch (err) { /* not capturable */ }
+      schedule(e);
+    });
+    bar.addEventListener('pointermove', (e) => { if (dragging) schedule(e); });
+    const end = (e) => {
+      if (!dragging) return;
+      dragging = false;
+      if (e.type === 'pointerup') pending = timeAt(e);
+      clearTimeout(timer);
+      apply();
+    };
+    bar.addEventListener('pointerup', end);
+    bar.addEventListener('pointercancel', end);
+    // Buffering after a seek shows the spinner instead of a frozen frame
+    video.addEventListener('waiting', () => { if (!video.paused || video.seeking) showLoading(); });
+    for (const ev of ['playing', 'canplay', 'seeked']) {
+      video.addEventListener(ev, () => { if (!video.seeking) hideLoading(); });
+    }
+  }
+
+  async function startLocalPlayback() {
+    // There is no transcode session: hide its controls, keep everything else
+    document.getElementById('menu-transcode')?.classList.add('hidden');
+    document.getElementById('menu-restart')?.classList.add('hidden');
+    setupLocalScrub();
+    showLoading();
+    showSeekStatus('Analyse du fichier…');
+    let plan;
+    try {
+      const resp = await fetch('/api/local/' + encodeURIComponent(cfg.localDownloadId) + '/plan');
+      if (!resp.ok) throw new Error('plan ' + resp.status);
+      plan = await resp.json();
+    } catch (e) {
+      console.error('[LOCAL] plan failed:', e);
+      showLocalError('Impossible d’analyser ce fichier.');
+      return;
+    }
+    totalDuration = plan.duration || 0;
+    transcodedDuration = totalDuration;
+    seekOffset = 0;
+    if (totalDuration > 0) {
+      document.getElementById('seek-duration').textContent = '/ ' + formatTime(totalDuration);
+      document.getElementById('time-duration').textContent = formatTime(totalDuration);
+    }
+    document.getElementById('progress-container')?.classList.remove('hidden');
+    document.getElementById('menu-jump')?.classList.remove('hidden');
+    setupLocalSubtitles(plan);
+    localModes = Local.chooseModes(plan, Local.detectCaps(video, window));
+    localModeIdx = 0;
+    if (localModes.length === 0) {
+      showLocalError('Ce fichier ne peut pas être lu dans le navigateur.');
+      return;
+    }
+    startLocalMode(localModes[0], Local.startAt(cfg.serverResumePosition, totalDuration));
+  }
+
   function init() {
     setupDownloadButton();
     // Restore persistent settings
     const settings = loadSettings();
     if (settings.volume !== undefined) video.volume = settings.volume;
     if (settings.muted !== undefined) video.muted = settings.muted;
-    if (settings.ccEnabled !== undefined) ccEnabled = settings.ccEnabled;
+    // Subtitles start off on every video (turned on from the CC menu or Shift+C);
+    // the saved ccEnabled is deliberately not restored.
 
     applyCaptionStyles();
     setupPositionTracking();
@@ -1747,14 +2131,17 @@
     window.addEventListener('pagehide', cleanupTranscodeSync);
     window.addEventListener('pageshow', event => {
       if (event.persisted && transcodeSession.closed) {
+        if (cfg.localDownloadId) { location.reload(); return; }
         transcodeSession.reopen();
         if (isTranscoding) startTranscode();
         else playWithUrl(cfg.rawUrl);
       }
     });
 
-    // Start playback based on transcode mode
-    if (cfg.transcodeMode === 'always') {
+    // Start playback based on transcode mode (finished downloads never transcode)
+    if (cfg.localDownloadId) {
+      startLocalPlayback();
+    } else if (cfg.transcodeMode === 'always') {
       startTranscode();
     } else if (cfg.transcodeMode === 'never') {
       playWithUrl(cfg.rawUrl);

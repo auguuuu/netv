@@ -422,9 +422,11 @@ class TestIndex:
 class TestFavicon:
     """Tests for favicon."""
 
-    def test_favicon_returns_204(self, client):
+    def test_favicon_is_served_without_login(self, client):
         resp = client.get("/favicon.ico")
-        assert resp.status_code == 204
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("image/svg+xml")
+        assert b"<svg" in resp.content
 
 
 class TestGuide:
