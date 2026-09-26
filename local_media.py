@@ -11,19 +11,26 @@ A downloaded file is local, so nothing here needs a live transcode session:
   no session, no long running ffmpeg and nothing to restart when seeking: any
   segment can be fetched at any time, in any order.
 
-Layout of the HLS presentation:
+Layout of the HLS presentation (the same as the transcode path, see
+``ffmpeg_command.build_hls_ffmpeg_cmd``): classic MPEG-TS segments written by ffmpeg's
+own muxer, no hand made containers and no timestamp patching.
 
-* video: fragmented MP4 segments, stream copy cut on keyframes (variant
-  ``copy``) or re-encoded to H.264 on a fixed grid (variant ``x264``, used when
-  the video codec is not playable or as a last resort fallback);
-* audio: one rendition per audio track, on a grid of whole AAC frames. AAC
-  tracks are copied, anything else is encoded to AAC with 2 frames of lead in
-  so that the independently encoded segments overlap-add cleanly;
+* one video (+ audio) segment per keyframe cut: stream copy of the video (variant
+  ``copy``) or H.264 re-encode on a fixed grid (variant ``x264``, when the codec is not
+  playable or as a last resort fallback);
+* a file with at most one audio track has that audio muxed into the video segments; with
+  2 or more, the video segments are video only and every track is an audio-only rendition
+  (``EXT-X-MEDIA``) cut on the very same segment boundaries;
+* audio: AAC-LC stereo is copied, anything else is encoded to AAC (stereo, 48 kHz) on a
+  global grid of whole frames, with 2 frames of lead in that are dropped, so the
+  independently encoded segments overlap-add like one continuous encode;
 * subtitles: not part of HLS. Text tracks are extracted once to complete WebVTT
   files (``/local/{id}/sub/{n}.vtt``) that the player loads as text tracks.
 
-Every emitted timestamp is ``pts - T0 + TIMELINE_OFFSET`` with T0 the pts of the
-first video keyframe, so all renditions share one exact timeline.
+Every segment is cut with ``-ss`` before ``-i`` (timestamps restart at the seek point) and
+placed with ``-output_ts_offset``, so every emitted timestamp is
+``pts - T0 + TIMELINE_OFFSET`` with T0 the pts of the first video keyframe, and segment
+n+1 continues segment n exactly.
 
 Only finished files inside the download folder are ever served (the path comes
 from ``downloads.DownloadManager.file_for``, never from the request).
@@ -44,7 +51,6 @@ import math
 import os
 import pathlib
 import re
-import struct
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from fastapi.responses import FileResponse
@@ -54,13 +60,12 @@ import downloads
 
 log = logging.getLogger(__name__)
 
-PLAN_VERSION = 4  # bump when the plan / segment layout changes (invalidates caches)
+PLAN_VERSION = 5  # bump when the plan / segment layout changes (invalidates caches)
 TARGET_SEGMENT_SEC = 6.0
 MAX_COPY_SEGMENT_SEC = 90.0  # longer keyframe gaps: re-encode on a fixed grid instead
 TIMELINE_OFFSET = 1.0  # seconds added to every timestamp (keeps dts >= 0 with B-frames)
 AAC_FRAME = 1024
-AUDIO_LEAD_FRAMES = 2  # encoder warm up frames so chunks overlap-add like one stream
-AUDIO_CHUNK_SEGMENTS = 8  # encoded audio segments made by one ffmpeg run (no seam inside)
+AUDIO_LEAD_FRAMES = 2  # encoder warm up frames so independent segments overlap-add cleanly
 OUT_SAMPLE_RATE = 48000
 VARIANTS = ("copy", "x264")
 DEFAULT_CACHE_MB = 1024
@@ -69,8 +74,8 @@ MAX_CONCURRENT_JOBS = 4
 
 DIRECT_VIDEO = {"h264", "hevc", "vp9", "av1"}
 DIRECT_AUDIO = {"aac", "mp3", "opus", "flac", "vorbis"}
-# Video codecs whose fragmented MP4 copy plays through MSE (client still verifies support)
-HLS_COPY_VIDEO = {"h264", "hevc", "av1", "vp9"}
+# Video codecs that can be copied into MPEG-TS (hls.js transmuxes them for MSE)
+HLS_COPY_VIDEO = {"h264", "hevc"}
 TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text", "subviewer"}
 
 LANG_2 = {
@@ -328,7 +333,7 @@ def hls_variant_mime(info: MediaInfo, variant: str) -> str:
 
 
 def video_variant_needs_encode(info: MediaInfo) -> bool:
-    """True when stream copy cannot produce a playable fragmented MP4."""
+    """True when stream copy cannot produce a playable MPEG-TS."""
     return info.video is None or info.video.codec not in HLS_COPY_VIDEO
 
 
@@ -343,6 +348,9 @@ class VideoSeg:
     duration: float
     abs_start: float  # keyframe pts in the file (copy), unused for x264
     packets: int  # video packets in the segment (copy), 0 for x264
+    span: float = (
+        0.0  # copy: input length that ends just before the next keyframe's dts (0 = unknown)
+    )
 
 
 @dataclass(frozen=True)
@@ -351,6 +359,7 @@ class KeyframeIndex:
     packets: int
     end: float  # pts of the last frame + one frame duration
     frame_dur: float
+    dts: tuple[float, ...] = ()  # decode time of each keyframe (nan when unknown), parallel
 
 
 def plan_video_copy(kf: KeyframeIndex, target: float = TARGET_SEGMENT_SEC) -> list[VideoSeg]:
@@ -372,13 +381,19 @@ def plan_video_copy(kf: KeyframeIndex, target: float = TARGET_SEGMENT_SEC) -> li
     tail = max(kf.end, last[0] + kf.frame_dur)
     if last is not cuts[-1] and tail - cuts[-1][0] > target + 1e-6:
         cuts.append(last)
+    dts_of = dict(zip((i for _, i in kf.keyframes), kf.dts, strict=False))
     segs: list[VideoSeg] = []
     for n, (t, i) in enumerate(cuts):
+        span = 0.0
         if n + 1 < len(cuts):
             nt, ni = cuts[n + 1]
+            nd = dts_of.get(ni, math.nan)
+            if not math.isnan(nd) and nd > t:
+                # the next keyframe's dts is the first packet of the next segment: stop half a frame before
+                span = round(nd - t - kf.frame_dur / 2, 6)
         else:
             nt, ni = max(kf.end, t + kf.frame_dur), kf.packets
-        segs.append(VideoSeg(round(t - t0, 6), round(nt - t, 6), t, max(1, ni - i)))
+        segs.append(VideoSeg(round(t - t0, 6), round(nt - t, 6), t, max(1, ni - i), span))
     return segs
 
 
@@ -393,50 +408,21 @@ def plan_video_grid(duration: float, seg: float = TARGET_SEGMENT_SEC) -> list[Vi
     return out
 
 
-@dataclass(frozen=True)
-class AudioGrid:
-    sample_rate: int
-    frames_per_segment: int
-    count: int
-    total_samples: int  # duration in samples
-
-    def seg_start_samples(self, k: int) -> int:
-        return k * self.frames_per_segment * AAC_FRAME
-
-    def seg_frames(self, k: int) -> int:
-        """AAC frames in segment k (the last one is shorter)."""
-        left = self.total_samples - self.seg_start_samples(k)
-        return max(1, min(self.frames_per_segment, math.ceil(left / AAC_FRAME)))
-
-    def seg_duration(self, k: int) -> float:
-        return self.seg_frames(k) * AAC_FRAME / self.sample_rate
-
-
-def plan_audio_grid(
-    duration: float, sample_rate: int, target: float = TARGET_SEGMENT_SEC
-) -> AudioGrid:
-    frames = max(1, round(target * sample_rate / AAC_FRAME))
-    total = max(1, math.ceil(duration * sample_rate))
-    count = max(1, math.ceil(total / (frames * AAC_FRAME)))
-    return AudioGrid(sample_rate, frames, count, total)
-
-
 # =============================================================================
 # Playlists (pure)
 # =============================================================================
 
 
-def media_playlist(init_uri: str, segments: list[tuple[str, float]]) -> str:
-    """Complete VOD media playlist (ENDLIST) for fragmented MP4 segments."""
+def media_playlist(segments: list[tuple[str, float]]) -> str:
+    """Complete VOD media playlist (ENDLIST) of MPEG-TS segments."""
     target = max(1, math.ceil(max((d for _, d in segments), default=1.0)))
     lines = [
         "#EXTM3U",
-        "#EXT-X-VERSION:7",
+        "#EXT-X-VERSION:3",
         f"#EXT-X-TARGETDURATION:{target}",
         "#EXT-X-MEDIA-SEQUENCE:0",
         "#EXT-X-PLAYLIST-TYPE:VOD",
         "#EXT-X-INDEPENDENT-SEGMENTS",
-        f'#EXT-X-MAP:URI="{init_uri}"',
     ]
     for uri, dur in segments:
         lines.append(f"#EXTINF:{dur:.6f},")
@@ -463,20 +449,27 @@ def audio_track_names(audio: tuple[AudioInfo, ...]) -> list[str]:
     return names
 
 
+def audio_is_separate(info: MediaInfo) -> bool:
+    """Same rule as the transcode path: 2+ audio tracks become audio-only renditions."""
+    return len(info.audio) >= 2
+
+
 def master_playlist(info: MediaInfo, variant: str) -> str:
     v = info.video
     assert v is not None
-    lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
-    names = audio_track_names(info.audio)
-    default_ord = next((a.ordinal for a in info.audio if a.default), 0)
-    for a, name in zip(info.audio, names, strict=True):
-        lang = LANG_2.get(a.lang.lower(), a.lang.lower()) or "und"
-        flag = "YES" if a.ordinal == default_ord else "NO"
-        lines.append(
-            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="{_attr(name)}",'
-            f'LANGUAGE="{_attr(lang)}",DEFAULT={flag},AUTOSELECT=YES,'
-            f'CHANNELS="{min(a.channels, 2)}",URI="a{a.ordinal}.m3u8"'
-        )
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-INDEPENDENT-SEGMENTS"]
+    separate = audio_is_separate(info)
+    if separate:
+        names = audio_track_names(info.audio)
+        default_ord = next((a.ordinal for a in info.audio if a.default), 0)
+        for a, name in zip(info.audio, names, strict=True):
+            lang = LANG_2.get(a.lang.lower(), a.lang.lower()) or "und"
+            flag = "YES" if a.ordinal == default_ord else "NO"
+            lines.append(
+                f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="{_attr(name)}",'
+                f'LANGUAGE="{_attr(lang)}",DEFAULT={flag},AUTOSELECT=YES,'
+                f'CHANNELS="{min(a.channels, 2)}",URI="a{a.ordinal}.m3u8"'
+            )
     codecs = ["avc1.640028" if variant == "x264" else video_codec_string(v)]
     if info.audio:
         codecs.append("mp4a.40.2")
@@ -489,114 +482,10 @@ def master_playlist(info: MediaInfo, variant: str) -> str:
         stream += f",RESOLUTION={v.width}x{v.height}"
     if v.fps:
         stream += f",FRAME-RATE={v.fps:.3f}"
-    if info.audio:
+    if separate:
         stream += ',AUDIO="aud"'
     lines += [stream, "v.m3u8"]
     return "\n".join(lines) + "\n"
-
-
-# =============================================================================
-# Fragmented MP4 helpers (pure)
-# =============================================================================
-
-
-def _boxes(data: bytes | bytearray, start: int, end: int):
-    """Yield (type, box_start, payload_start, box_end) for the boxes in [start, end)."""
-    off = start
-    while off + 8 <= end:
-        size, typ = struct.unpack_from(">I4s", data, off)
-        hdr = 8
-        if size == 1:
-            size = struct.unpack_from(">Q", data, off + 8)[0]
-            hdr = 16
-        elif size == 0:
-            size = end - off
-        if size < hdr or off + size > end:
-            raise ValueError("corrupt mp4 box")
-        yield typ, off, off + hdr, off + size
-        off += size
-
-
-def split_fmp4(data: bytes) -> tuple[bytes, bytes]:
-    """Split a fragmented MP4 into (init segment, media fragments)."""
-    for typ, box_start, _, _ in _boxes(data, 0, len(data)):
-        if typ in (b"moof", b"styp", b"sidx"):
-            return data[:box_start], data[box_start:]
-    raise ValueError("no fragment in mp4 output")
-
-
-def _trafs(data: bytes | bytearray):
-    for typ, _, payload, end in _boxes(data, 0, len(data)):
-        if typ != b"moof":
-            continue
-        for ttyp, _, tpayload, tend in _boxes(data, payload, end):
-            if ttyp == b"traf":
-                yield tpayload, tend
-
-
-def first_composition_offset(media: bytes) -> int:
-    """Composition offset (ticks) of the first sample, 0 when the fragment has none."""
-    for tpayload, tend in _trafs(media):
-        for typ, _, payload, _end in _boxes(media, tpayload, tend):
-            if typ != b"trun":
-                continue
-            version = media[payload]
-            flags = int.from_bytes(media[payload + 1 : payload + 4], "big")
-            count = struct.unpack_from(">I", media, payload + 4)[0]
-            if not flags & 0x800 or count == 0:
-                return 0
-            pos = payload + 8
-            if flags & 0x1:
-                pos += 4
-            if flags & 0x4:
-                pos += 4
-            for bit in (0x100, 0x200, 0x400):
-                if flags & bit:
-                    pos += 4
-            fmt = ">i" if version >= 1 else ">I"
-            return int(struct.unpack_from(fmt, media, pos)[0])
-        return 0
-    return 0
-
-
-def first_base_time(media: bytes) -> int:
-    """baseMediaDecodeTime of the first fragment."""
-    for tpayload, tend in _trafs(media):
-        for typ, _, payload, _end in _boxes(media, tpayload, tend):
-            if typ == b"tfdt":
-                if media[payload] == 1:
-                    return struct.unpack_from(">Q", media, payload + 4)[0]
-                return struct.unpack_from(">I", media, payload + 4)[0]
-    return 0
-
-
-def set_first_base_time(media: bytes, target: int) -> bytes:
-    """Shift every tfdt so the first fragment starts at ``target`` ticks (keeps the spacing)."""
-    delta = target - first_base_time(media)
-    out = bytearray(media)
-    for tpayload, tend in _trafs(media):
-        for typ, _, payload, _end in _boxes(media, tpayload, tend):
-            if typ != b"tfdt":
-                continue
-            if out[payload] == 1:
-                cur = struct.unpack_from(">Q", out, payload + 4)[0]
-                struct.pack_into(">Q", out, payload + 4, max(0, cur + delta))
-            else:
-                new = struct.unpack_from(">I", out, payload + 4)[0] + delta
-                if not 0 <= new < 2**32:
-                    raise ValueError("timestamp does not fit a 32 bit tfdt")
-                struct.pack_into(">I", out, payload + 4, new)
-    return bytes(out)
-
-
-def mp4_timescale(init: bytes) -> int:
-    """Track timescale from the mdhd box of an init segment."""
-    idx = init.find(b"mdhd")
-    if idx < 0:
-        return 16000
-    version = init[idx + 4]
-    pos = idx + 8 + (8 if version == 0 else 16)
-    return struct.unpack_from(">I", init, pos)[0] or 16000
 
 
 def adts_packets(data: bytes) -> list[bytes]:
@@ -646,162 +535,143 @@ def shift_vtt(text: str, delta: float) -> str:
 # =============================================================================
 # ffmpeg command builders (pure)
 # =============================================================================
+#
+# One segment = one short ffmpeg run producing MPEG-TS with ffmpeg's own muxer, the same
+# container and codecs as the transcode path (ffmpeg_command.build_hls_ffmpeg_cmd): video
+# copied on keyframes (or x264), audio copied (AAC-LC stereo) or encoded to AAC. The input
+# is seeked with ``-ss`` BEFORE ``-i`` (timestamps restart at 0 at the seek point) and
+# ``-output_ts_offset`` puts every segment back on the shared timeline, so segment n+1
+# continues segment n by construction (never mixed with ``-copyts``).
 
-_MOV_FLAGS = "empty_moov+default_base_moof+frag_keyframe"
+_TS_OUT = [
+    "-avoid_negative_ts", "disabled", "-muxdelay", "0", "-muxpreload", "0",
+    "-f", "mpegts", "pipe:1",
+]  # fmt: skip
+_BASE = ["ffmpeg", "-nostdin", "-v", "error", "-y"]
 
 
 def _seek_args(seconds: float) -> list[str]:
-    return ["-ss", f"{seconds:.6f}"] if seconds > 0 else []
+    return ["-ss", f"{max(seconds, 0.0):.6f}"] if seconds > 0 else []
 
 
-def video_copy_cmd(path: str, info: MediaInfo, seg: VideoSeg) -> list[str]:
+def seg_file_start(pres_t0: float, variant: str, seg: VideoSeg) -> float:
+    """Position of the segment start in the file (file clock, before the format start)."""
+    return seg.abs_start if variant == "copy" else pres_t0 + seg.start
+
+
+def _video_input(
+    path: str, info: MediaInfo, variant: str, t0: float, seg: VideoSeg, muxed: bool
+) -> tuple[list[str], list[str]]:
+    """(input args, output args) of the video part of a segment.
+
+    A copied video stream normally stops after exactly ``seg.packets`` packets. That
+    ``-frames:v`` limit also ends the audio of the same run early, so when audio is muxed in,
+    the video input is limited by time instead (``seg.span``, from the keyframe dts).
+    """
     assert info.video is not None
     v = info.video
-    tag = ["-tag:v", "hvc1"] if v.codec == "hevc" else []
-    return [
-        "ffmpeg", "-nostdin", "-v", "error", "-y",
-        *_seek_args(seg.abs_start - info.start),
-        "-i", path, "-map", f"0:{v.index}", "-c:v", "copy", "-copypriorss", "0", *tag,
-        "-frames:v", str(seg.packets), "-an", "-sn", "-dn",
-        "-f", "mp4", "-movflags", _MOV_FLAGS, "pipe:1",
-    ]  # fmt: skip
-
-
-def video_x264_cmd(path: str, info: MediaInfo, seg: VideoSeg, t0: float) -> list[str]:
-    assert info.video is not None
-    v = info.video
+    seek = _seek_args(seg_file_start(t0, variant, seg) - info.start)
+    if variant == "copy":
+        limit = ["-t", f"{seg.span:.6f}"] if muxed and seg.span > 0 else []
+        out = ["-map", "0:0", "-c:v", "copy", "-copypriorss", "0"]
+        if not limit:
+            out += ["-frames:v", str(seg.packets)]
+        return [*seek, *limit, "-i", path], out
     fps = v.fps if 1 < v.fps < 120 else 24.0
-    return [
-        "ffmpeg", "-nostdin", "-v", "error", "-y",
-        *_seek_args((t0 - info.start) + seg.start),
-        "-i", path, "-map", f"0:{v.index}", "-t", f"{seg.duration:.6f}",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
-        "-profile:v", "high", "-level:v", "4.0", "-bf", "0", "-g", str(int(fps * 12)),
-        "-an", "-sn", "-dn",
-        "-f", "mp4", "-movflags", _MOV_FLAGS, "pipe:1",
+    out = [
+        "-map", "0:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        "-pix_fmt", "yuv420p", "-profile:v", "high", "-level:v", "4.0", "-bf", "0",
+        "-g", str(int(fps * 12)),
     ]  # fmt: skip
+    return [*seek, "-t", f"{seg.duration:.6f}", "-i", path], out
 
 
-def audio_copy_cmd(path: str, info: MediaInfo, a: AudioInfo, grid: AudioGrid, k: int) -> list[str]:
-    """Stream copy of the AAC frames of segment k (cut on frame boundaries).
-
-    ``-copypriorss 0`` is essential: an input seek on a real mkv lands on the cue point
-    BEFORE the target (often 1 to 2 s earlier), and without it ffmpeg copies every packet
-    from there, so the segment holds audio from earlier than its timestamp (the sound
-    then lags the picture by up to seconds). It drops the packets before the seek time.
-    """
-    seek = (a.start - info.start) + grid.seg_start_samples(k) / grid.sample_rate
-    seek -= AAC_FRAME / (2 * grid.sample_rate)  # land in the middle of the frame before
-    return [
-        "ffmpeg", "-nostdin", "-v", "error", "-y",
-        *_seek_args(seek),
-        "-i", path, "-map", f"0:{a.index}", "-c:a", "copy", "-copypriorss", "0",
-        "-frames:a", str(grid.seg_frames(k)), "-vn", "-sn", "-dn",
-        "-f", "mp4", "-movflags", "empty_moov+default_base_moof", "pipe:1",
-    ]  # fmt: skip
-
-
-def audio_encode_cmd(
-    path: str, info: MediaInfo, a: AudioInfo, grid: AudioGrid, first: int, count: int, t0: float
+def segment_cmd(
+    path: str,
+    info: MediaInfo,
+    variant: str,
+    t0: float,
+    seg: VideoSeg,
+    *,
+    video: bool,
+    audio: AudioInfo | None,
+    piped_audio_shift: float | None = None,
 ) -> list[str]:
-    """Encode AAC for ``count`` consecutive segments starting at segment ``first``.
+    """One TS segment: ``video`` and/or ``audio`` (copied from the file, or, when
+    ``piped_audio_shift`` is set, AAC packets read from stdin that start ``shift`` seconds
+    after the segment start).
 
-    One continuous encode covers the whole chunk, so there is no seam inside it. The encoder
-    starts ``AUDIO_LEAD_FRAMES`` frames early (priming packet + warm up) so the first kept
-    packet equals what one continuous encode of the whole track would have produced (see
-    ``audio_chunk_slice``). A chunk starting at segment 0 keeps the priming packet (its
-    timestamp is one frame before 0) so the decoder overlaps correctly.
+    The video and the audio are two inputs of the same file, each limited to the time
+    window of the segment: ffmpeg's own ``-ss``/``-t`` decide which packets belong to it.
     """
-    frames = sum(grid.seg_frames(k) for k in range(first, first + count))
-    seek = (t0 - info.start) + grid.seg_start_samples(first) / grid.sample_rate
-    if first == 0:
-        total = frames + 1
-    else:
-        total = AUDIO_LEAD_FRAMES + 1 + frames
-        seek -= AUDIO_LEAD_FRAMES * AAC_FRAME / grid.sample_rate
-    channels = ["-ac", "2"] if a.channels > 2 else []
-    bitrate = "96k" if a.channels == 1 else "192k"
-    cmd = [
-        "ffmpeg", "-nostdin", "-v", "error", "-y",
-        *_seek_args(seek),
-        "-i", path, "-map", f"0:{a.index}",
-        "-af", f"aresample={grid.sample_rate}:async=1:first_pts=0",
-        "-c:a", "aac", "-b:a", bitrate, *channels,
-        "-frames:a", str(total), "-vn", "-sn", "-dn",
-        "-f", "adts", "pipe:1",
-    ]  # fmt: skip
+    cmd = list(_BASE)
+    nxt = 0  # index of the next input
+    vmap: list[str] = []
+    if video:
+        vin, vmap = _video_input(path, info, variant, t0, seg, muxed=audio is not None)
+        cmd += [*vin]
+        nxt += 1
+    amap: list[str] = []
+    if audio is not None:
+        if piped_audio_shift is not None:
+            cmd += ["-itsoffset", f"{piped_audio_shift:.6f}", "-f", "aac", "-i", "pipe:0"]
+            amap = ["-map", f"{nxt}:a", "-c:a", "copy"]
+        else:
+            seek = _seek_args(seg_file_start(t0, variant, seg) - info.start)
+            cmd += [*seek, "-t", f"{seg.duration:.6f}", "-i", path]
+            amap = ["-map", f"{nxt}:{audio.index}", "-c:a", "copy", "-copypriorss", "0"]
+    cmd += [*vmap, *amap]
+    if not video:
+        cmd += ["-vn"]
+    if audio is None:
+        cmd += ["-an"]
+    cmd += ["-sn", "-dn", "-output_ts_offset", f"{seg.start + TIMELINE_OFFSET:.6f}", *_TS_OUT]
     return cmd
 
 
-def audio_chunk_range(grid: AudioGrid, first: int, k: int) -> tuple[int, int, int]:
-    """(start, stop, timestamp shift in samples) of segment k's packets in the chunk stream.
+def audio_pipe_cmd(path: str, info: MediaInfo, a: AudioInfo, t0: float, f0: int, count: int):
+    """Encode AAC for global frames [f0, f0 + count) of the 48 kHz frame grid (ADTS on stdout).
 
-    A chunk starting at segment 0 begins with the encoder priming packet, which sits one frame
-    before time 0 and travels with segment 0. A later chunk begins with the priming packet and
-    ``AUDIO_LEAD_FRAMES`` warm up packets, which are skipped.
+    The grid starts at the first keyframe. The encoder starts ``lead`` frames early so
+    that the packets kept (see ``audio_keep_from``) are the ones a single continuous encode
+    of the whole track would produce, up to quantisation: every segment then splices onto
+    the previous one with the AAC overlap-add intact.
     """
-    frames = grid.seg_frames(k)
-    if first == 0:
-        if k == 0:
-            return 0, frames + 1, -AAC_FRAME
-        start = 1 + k * grid.frames_per_segment
-    else:
-        start = AUDIO_LEAD_FRAMES + 1 + (k - first) * grid.frames_per_segment
-    return start, start + frames, 0
-
-
-def audio_chunk_slice(
-    packets: list[bytes], grid: AudioGrid, first: int, k: int
-) -> tuple[list[bytes], int]:
-    """AAC packets of segment k inside the chunk that starts at segment ``first``."""
-    start, stop, shift = audio_chunk_range(grid, first, k)
-    return packets[start:stop], shift
-
-
-class AdtsStream:
-    """Incremental ADTS parser: feed bytes as they arrive, complete frames appear in packets."""
-
-    def __init__(self) -> None:
-        self.packets: list[bytes] = []
-        self._pending = bytearray()
-
-    def feed(self, data: bytes) -> None:
-        self._pending += data
-        buf = self._pending
-        i = 0
-        while i + 7 <= len(buf):
-            if buf[i] != 0xFF or buf[i + 1] & 0xF0 != 0xF0:
-                raise ValueError("lost ADTS sync")
-            length = ((buf[i + 3] & 3) << 11) | (buf[i + 4] << 3) | (buf[i + 5] >> 5)
-            if length < 7:
-                raise ValueError("bad ADTS frame length")
-            if i + length > len(buf):
-                break
-            self.packets.append(bytes(buf[i : i + length]))
-            i += length
-        del buf[:i]
-
-
-def audio_mux_cmd() -> list[str]:
-    """ADTS on stdin -> fragmented MP4 on stdout (stream copy, timestamps start at 0)."""
+    lead = min(AUDIO_LEAD_FRAMES, f0)
+    start = (f0 - lead) * AAC_FRAME / OUT_SAMPLE_RATE
+    channels = ["-ac", "2"] if a.channels > 2 else []
+    bitrate = "96k" if a.channels == 1 else "192k"
     return [
-        "ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "aac", "-i", "pipe:0", "-c:a", "copy",
-        "-bsf:a", "aac_adtstoasc", "-f", "mp4", "-movflags", "empty_moov+default_base_moof", "pipe:1",
+        *_BASE, *_seek_args((t0 - info.start) + start),
+        "-i", path, "-map", f"0:{a.index}",
+        "-af", f"aresample={OUT_SAMPLE_RATE}:async=1:first_pts=0",
+        "-c:a", "aac", "-b:a", bitrate, *channels, "-profile:a", "aac_low",
+        "-frames:a", str(lead + 1 + count), "-vn", "-sn", "-dn",
+        "-f", "adts", "pipe:1",
     ]  # fmt: skip
 
 
-def audio_init_cmd(sample_rate: int, channels: int) -> list[str]:
-    """One silent AAC frame muxed to fMP4: only its init segment (decoder config) is used.
+def audio_frame_range(seg_start: float, seg_end: float) -> tuple[int, int]:
+    """Global 48 kHz AAC frame range [f0, f1) whose start lies inside [seg_start, seg_end)."""
+    f0 = math.ceil(seg_start * OUT_SAMPLE_RATE / AAC_FRAME - 1e-6)
+    f1 = math.ceil(seg_end * OUT_SAMPLE_RATE / AAC_FRAME - 1e-6)
+    return f0, max(f1, f0 + 1)
 
-    The ADTS -> MP4 step cannot write the decoder config (it is only known after the first
-    packet, the fragmented header is written before), so the init comes from the encoder.
+
+def audio_keep_from(f0: int) -> int:
+    """Index of the first kept packet in the encode that started at frame ``f0 - lead``.
+
+    Packet j holds the audio of frame ``f0 - lead + j - 1`` (packet 0 is the encoder priming
+    packet). The first segment keeps everything (its priming packet lies before time 0).
     """
-    layout = "mono" if channels == 1 else "stereo"
+    return 0 if f0 == 0 else min(AUDIO_LEAD_FRAMES, f0) + 1
+
+
+def audio_only_pipe_cmd(first_packet_time: float, seg: VideoSeg) -> list[str]:
+    """ADTS on stdin -> audio-only TS whose first packet sits at ``first_packet_time`` (s)."""
     return [
-        "ffmpeg", "-nostdin", "-v", "error", "-y",
-        "-f", "lavfi", "-i", f"anullsrc=r={sample_rate}:cl={layout}",
-        "-c:a", "aac", "-b:a", "96k" if channels == 1 else "192k", "-frames:a", "2",
-        "-f", "mp4", "-movflags", "empty_moov+default_base_moof", "pipe:1",
+        *_BASE, "-f", "aac", "-i", "pipe:0", "-map", "0:a", "-c:a", "copy",
+        "-output_ts_offset", f"{first_packet_time + TIMELINE_OFFSET:.6f}", *_TS_OUT,
     ]  # fmt: skip
 
 
@@ -822,6 +692,7 @@ def scan_cmd(path: str, video_index: int) -> list[str]:
 def parse_scan(lines: Any, default_fps: float = 24.0) -> KeyframeIndex:
     """Parse ``pts,dts,flags`` packet lines (decode order) into a KeyframeIndex."""
     keyframes: list[tuple[float, int]] = []
+    kf_dts: list[float] = []
     count = 0
     last_pts = 0.0
     prev_dts: float | None = None
@@ -839,6 +710,7 @@ def parse_scan(lines: Any, default_fps: float = 24.0) -> KeyframeIndex:
             continue
         if parts[2][:1] == "K":
             keyframes.append((pts, count))
+            kf_dts.append(dts)
         last_pts = max(last_pts, pts)
         if not math.isnan(dts):
             if prev_dts is not None and dts - prev_dts > 0 and len(deltas) < 500:
@@ -847,7 +719,7 @@ def parse_scan(lines: Any, default_fps: float = 24.0) -> KeyframeIndex:
         count += 1
     deltas.sort()
     frame_dur = deltas[len(deltas) // 2] if deltas else 1.0 / default_fps
-    return KeyframeIndex(tuple(keyframes), count, last_pts + frame_dur, frame_dur)
+    return KeyframeIndex(tuple(keyframes), count, last_pts + frame_dur, frame_dur, tuple(kf_dts))
 
 
 # =============================================================================
@@ -864,7 +736,6 @@ class Presentation:
     t0: float  # pts of the first video keyframe (presentation time 0)
     duration: float
     video: list[VideoSeg]
-    audio_grids: list[AudioGrid]
     key: str
     dir: pathlib.Path
     path: str
@@ -887,25 +758,6 @@ def cache_limit_bytes() -> int:
     return max(16, mb) * 1024 * 1024
 
 
-class _ChunkJob:
-    """A running audio chunk encode: packets become available while ffmpeg is still going."""
-
-    def __init__(self) -> None:
-        self.stream = AdtsStream()
-        self.done = False
-        self.error: Exception | None = None
-        self.changed = asyncio.Condition()
-        self.task: asyncio.Task[None] | None = None
-
-    async def wait_for(self, count: int) -> list[bytes]:
-        """Block until ``count`` packets exist (or the encode ended); returns the packets."""
-        async with self.changed:
-            await self.changed.wait_for(lambda: len(self.stream.packets) >= count or self.done)
-        if len(self.stream.packets) < count:
-            raise self.error or RuntimeError("audio encode ended early")
-        return self.stream.packets
-
-
 class LocalMedia:
     """Probe, plan and produce HLS pieces for local files. One instance per process."""
 
@@ -915,9 +767,6 @@ class LocalMedia:
         self._infos: dict[str, MediaInfo] = {}
         self._kfs: dict[str, KeyframeIndex] = {}
         self._pres: dict[str, Presentation] = {}
-        self._encoder_inits: dict[tuple[int, int], bytes] = {}
-        self._chunk_jobs: dict[str, _ChunkJob] = {}
-        self._chunk_slots: asyncio.Semaphore | None = None
         self._locks: dict[str, asyncio.Lock] = {}
         self._jobs: asyncio.Semaphore | None = None
         self._writes = 0
@@ -1002,6 +851,7 @@ class LocalMedia:
                     int(raw["packets"]),
                     float(raw["end"]),
                     float(raw["frame_dur"]),
+                    tuple(float(d) if d is not None else math.nan for d in raw.get("dts", ())),
                 )
                 self._kfs[key] = kf
                 return kf
@@ -1015,6 +865,7 @@ class LocalMedia:
                 "packets": kf.packets,
                 "end": kf.end,
                 "frame_dur": kf.frame_dur,
+                "dts": [None if math.isnan(d) else d for d in kf.dts],
             }
             tmp.write_text(json.dumps(payload))
             tmp.replace(store)
@@ -1042,12 +893,8 @@ class LocalMedia:
         if variant == "copy" and max(s.duration for s in video) > MAX_COPY_SEGMENT_SEC:
             variant = "x264"
             video = plan_video_grid(duration)
-        grids = [
-            plan_audio_grid(duration, a.sample_rate if hls_audio_is_copy(a) else OUT_SAMPLE_RATE)
-            for a in info.audio
-        ]
         pres = Presentation(
-            info, variant, t0, duration, video, grids, key, self.root / key / variant, str(path)
+            info, variant, t0, duration, video, key, self.root / key / variant, str(path)
         )
         self._pres[f"{key}:{variant}"] = pres
         return pres
@@ -1078,132 +925,49 @@ class LocalMedia:
                 await asyncio.to_thread(self.trim_cache)
             return target
 
-    async def video_segment(self, pres: Presentation, k: int) -> pathlib.Path:
+    def segment_window(self, pres: Presentation, k: int) -> tuple[float, float]:
+        """[start, end) of segment k on the presentation timeline."""
         seg = pres.video[k]
+        return seg.start, seg.start + seg.duration
+
+    async def segment(self, pres: Presentation, n: int | None, k: int) -> pathlib.Path:
+        """Segment k as MPEG-TS. ``n`` is the audio track of an audio-only rendition; ``None``
+        is the video segment (with the only audio track muxed in when the file has one)."""
+        info = pres.info
+        seg = pres.video[k]
+        muxed = not audio_is_separate(info)
+        if n is None:
+            audio = info.audio[0] if muxed and info.audio else None
+            name = f"v/{k}.ts"
+        else:
+            audio = info.audio[n]
+            name = f"a{n}/{k}.ts"
 
         async def produce() -> dict[str, bytes]:
-            if pres.variant == "copy":
-                cmd = video_copy_cmd(pres.path, pres.info, seg)
-            else:
-                cmd = video_x264_cmd(pres.path, pres.info, seg, pres.t0)
-            init, media = split_fmp4(await self._run(cmd))
-            ticks = mp4_timescale(init)
-            target = round((seg.start + TIMELINE_OFFSET) * ticks) - first_composition_offset(media)
-            return {f"v/{k}.m4s": set_first_base_time(media, max(0, target)), "v/init.mp4": init}
-
-        return await self._cached(pres, f"v/{k}.m4s", produce)
-
-    async def video_init(self, pres: Presentation) -> pathlib.Path:
-        target = pres.dir / "v" / "init.mp4"
-        if not target.is_file():
-            await self.video_segment(pres, 0)
-        return target
-
-    async def _run_chunk(self, job: _ChunkJob, cmd: list[str], target: pathlib.Path, name: str):
-        """Encode a chunk, publishing packets as they come, then cache the whole stream."""
-        if self._chunk_slots is None:
-            self._chunk_slots = asyncio.Semaphore(2)
-        proc = None
-        try:
-            async with self._chunk_slots:
-                self.ffmpeg_runs += 1
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL,
+            if audio is None or hls_audio_is_copy(audio):
+                cmd = segment_cmd(
+                    pres.path, info, pres.variant, pres.t0, seg, video=n is None, audio=audio
                 )
-                assert proc.stdout is not None
-                while data := await proc.stdout.read(1 << 16):
-                    job.stream.feed(data)
-                    async with job.changed:
-                        job.changed.notify_all()
-                if await proc.wait() != 0:
-                    raise RuntimeError(f"audio chunk encode failed ({proc.returncode})")
-            if job.stream.packets:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp")
-                tmp.write_bytes(b"".join(job.stream.packets))
-                tmp.replace(target)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            job.error = exc
-        finally:
-            if proc is not None and proc.returncode is None:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await proc.wait()
-            job.done = True
-            async with job.changed:
-                job.changed.notify_all()
-            self._chunk_jobs.pop(name, None)
-
-    async def _audio_packets(self, pres: Presentation, n: int, k: int) -> tuple[list[bytes], int]:
-        """Encoded AAC packets of audio segment k (and their timestamp shift).
-
-        Segments of one chunk come from ONE continuous ffmpeg encode (no seam between them);
-        the first packets are usable while ffmpeg is still encoding the rest of the chunk.
-        """
-        a = pres.info.audio[n]
-        grid = pres.audio_grids[n]
-        c = k // AUDIO_CHUNK_SEGMENTS
-        first = c * AUDIO_CHUNK_SEGMENTS
-        start, stop, shift = audio_chunk_range(grid, first, k)
-        cached = pres.dir / f"a{n}" / f"c{c}.adts"
-        if cached.is_file():
-            with contextlib.suppress(OSError):
-                os.utime(cached)
-            packets = adts_packets(await asyncio.to_thread(cached.read_bytes))
-            return packets[start:stop], shift
-        name = f"{pres.key}:{pres.variant}:a{n}:c{c}"
-        job = self._chunk_jobs.get(name)
-        if job is None:
-            count = min(AUDIO_CHUNK_SEGMENTS, grid.count - first)
-            cmd = audio_encode_cmd(pres.path, pres.info, a, grid, first, count, pres.t0)
-            job = self._chunk_jobs[name] = _ChunkJob()
-            job.task = asyncio.create_task(self._run_chunk(job, cmd, cached, name))
-        packets = await job.wait_for(stop)
-        return packets[start:stop], shift
-
-    async def audio_segment(self, pres: Presentation, n: int, k: int) -> pathlib.Path:
-        a = pres.info.audio[n]
-        grid = pres.audio_grids[n]
-
-        async def produce() -> dict[str, bytes]:
-            copy = hls_audio_is_copy(a)
-            if copy:
-                raw = await self._run(audio_copy_cmd(pres.path, pres.info, a, grid, k))
-                init, media = split_fmp4(raw)
-                shift = round((a.start - pres.t0) * grid.sample_rate)
+                return {name: await self._run(cmd)}
+            start, end = self.segment_window(pres, k)
+            f0, f1 = audio_frame_range(start, end)
+            enc = audio_pipe_cmd(pres.path, info, audio, pres.t0, f0, f1 - f0)
+            packets = adts_packets(await self._run(enc))
+            keep = audio_keep_from(f0)
+            packets = packets[keep : keep + (f1 - f0) + (1 if f0 == 0 else 0)]
+            if not packets:
+                raise RuntimeError("audio encode produced no packets")
+            first = (f0 - 1 if f0 == 0 else f0) * AAC_FRAME / OUT_SAMPLE_RATE
+            if n is None:
+                cmd = segment_cmd(
+                    pres.path, info, pres.variant, pres.t0, seg,
+                    video=True, audio=audio, piped_audio_shift=first - seg.start,
+                )  # fmt: skip
             else:
-                packets, shift = await self._audio_packets(pres, n, k)
-                if not packets:
-                    raise RuntimeError("audio chunk has no packets for this segment")
-                raw = await self._run(audio_mux_cmd(), stdin=b"".join(packets))
-                init = await self._encoder_init(grid.sample_rate, 1 if a.channels == 1 else 2)
-                media = split_fmp4(raw)[1]
-            target = grid.seg_start_samples(k) + shift + round(TIMELINE_OFFSET * grid.sample_rate)
-            return {
-                f"a{n}/{k}.m4s": set_first_base_time(media, max(0, target)),
-                f"a{n}/init.mp4": init,
-            }
+                cmd = audio_only_pipe_cmd(first, seg)
+            return {name: await self._run(cmd, stdin=b"".join(packets))}
 
-        return await self._cached(pres, f"a{n}/{k}.m4s", produce)
-
-    async def _encoder_init(self, sample_rate: int, channels: int) -> bytes:
-        key = (sample_rate, channels)
-        if key not in self._encoder_inits:
-            raw = await self._run(audio_init_cmd(sample_rate, channels))
-            self._encoder_inits[key] = split_fmp4(raw)[0]
-        return self._encoder_inits[key]
-
-    async def audio_init(self, pres: Presentation, n: int) -> pathlib.Path:
-        target = pres.dir / f"a{n}" / "init.mp4"
-        if not target.is_file():
-            await self.audio_segment(pres, n, 0)
-        return target
+        return await self._cached(pres, name, produce)
 
     # --------------------------------------------------------- subtitles
 
@@ -1241,7 +1005,7 @@ class LocalMedia:
         """Delete the least recently used segments until the cache fits. Returns bytes freed."""
         files: list[tuple[float, int, pathlib.Path]] = []
         total = 0
-        for p in [*self.root.glob("*/*/*/*.m4s"), *self.root.glob("*/*/*/*.adts")]:
+        for p in [*self.root.glob("*/*/*/*.ts")]:
             with contextlib.suppress(OSError):
                 st = p.stat()
                 files.append((st.st_mtime, st.st_size, p))
@@ -1375,7 +1139,7 @@ def build_router(require_auth: Callable[..., Any]) -> APIRouter:
         # no-cache: the URLs do not change when a fix changes the segment bytes, and a browser
         # holding an old segment for minutes would keep playing the old (wrongly aligned) audio
         return FileResponse(
-            path, media_type="video/mp4", headers={"Cache-Control": "private, no-cache"}
+            path, media_type="video/mp2t", headers={"Cache-Control": "private, no-cache"}
         )
 
     def playlist(text: str) -> Response:
@@ -1405,43 +1169,32 @@ def build_router(require_auth: Callable[..., Any]) -> APIRouter:
     @router.get("/local/{download_id}/{variant}/v.m3u8", dependencies=auth)
     async def local_video_playlist(download_id: str, variant: str):
         pres = await presentation(download_id, variant)
-        segs = [(f"v/{i}.m4s", s.duration) for i, s in enumerate(pres.video)]
-        return playlist(media_playlist("v/init.mp4", segs))
+        segs = [(f"v/{i}.ts", s.duration) for i, s in enumerate(pres.video)]
+        return playlist(media_playlist(segs))
 
     @router.get("/local/{download_id}/{variant}/a{n}.m3u8", dependencies=auth)
     async def local_audio_playlist(download_id: str, variant: str, n: int):
         pres = await presentation(download_id, variant)
-        if not 0 <= n < len(pres.audio_grids):
+        if not audio_is_separate(pres.info) or not 0 <= n < len(pres.info.audio):
             raise HTTPException(404, "No such audio track")
-        grid = pres.audio_grids[n]
-        segs = [(f"a{n}/{k}.m4s", grid.seg_duration(k)) for k in range(grid.count)]
-        return playlist(media_playlist(f"a{n}/init.mp4", segs))
+        segs = [(f"a{n}/{k}.ts", s.duration) for k, s in enumerate(pres.video)]
+        return playlist(media_playlist(segs))
 
-    @router.get("/local/{download_id}/{variant}/v/init.mp4", dependencies=auth)
-    async def local_video_init(download_id: str, variant: str):
-        pres = await presentation(download_id, variant)
-        return await produce(get_service().video_init(pres))
-
-    @router.get("/local/{download_id}/{variant}/v/{k}.m4s", dependencies=auth)
+    @router.get("/local/{download_id}/{variant}/v/{k}.ts", dependencies=auth)
     async def local_video_segment(download_id: str, variant: str, k: int):
         pres = await presentation(download_id, variant)
         if not 0 <= k < len(pres.video):
             raise HTTPException(404, "No such segment")
-        return await produce(get_service().video_segment(pres, k))
+        return await produce(get_service().segment(pres, None, k))
 
-    @router.get("/local/{download_id}/{variant}/a{n}/init.mp4", dependencies=auth)
-    async def local_audio_init(download_id: str, variant: str, n: int):
-        pres = await presentation(download_id, variant)
-        if not 0 <= n < len(pres.audio_grids):
-            raise HTTPException(404, "No such audio track")
-        return await produce(get_service().audio_init(pres, n))
-
-    @router.get("/local/{download_id}/{variant}/a{n}/{k}.m4s", dependencies=auth)
+    @router.get("/local/{download_id}/{variant}/a{n}/{k}.ts", dependencies=auth)
     async def local_audio_segment(download_id: str, variant: str, n: int, k: int):
         pres = await presentation(download_id, variant)
-        if not 0 <= n < len(pres.audio_grids) or not 0 <= k < pres.audio_grids[n].count:
+        if not audio_is_separate(pres.info) or not 0 <= n < len(pres.info.audio):
             raise HTTPException(404, "No such segment")
-        return await produce(get_service().audio_segment(pres, n, k))
+        if not 0 <= k < len(pres.video):
+            raise HTTPException(404, "No such segment")
+        return await produce(get_service().segment(pres, n, k))
 
     @router.get("/local/{download_id}/sub/{n}.vtt", dependencies=auth)
     async def local_subtitle(download_id: str, n: int):

@@ -4,7 +4,7 @@
 // A local file never needs a server side transcode session: the player either
 // hands the raw file to <video> (native seeking) or loads a COMPLETE VOD HLS
 // playlist whose segments the server cuts on demand (any seek is just a
-// currentTime change). See local_media.py for the server half.
+// currentTime change). Segments are classic MPEG-TS cut by ffmpeg, like the transcode path. See local_media.py for the server half.
 (function(root) {
   'use strict';
 

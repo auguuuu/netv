@@ -1,6 +1,6 @@
 """Tests for local_media.py: instant seekable playback of finished downloads.
 
-Pure parts (codec decision, keyframe / segment plan, playlists, fMP4 patching) are unit tested.
+Pure parts (codec decision, keyframe / segment plan, playlists, ffmpeg command lines) are unit tested.
 The rest runs against small synthetic media generated with ffmpeg: every rendition is fetched
 through the real routes, decoded again with ffmpeg and checked for continuity, and random seeks
 are served without any restarted process.
@@ -15,10 +15,10 @@ from typing import Any
 import array
 import asyncio
 import json
+import math
 import random
 import re
 import shutil
-import struct
 import subprocess
 import time
 
@@ -30,36 +30,32 @@ import pytest
 from local_media import (
     AAC_FRAME,
     TIMELINE_OFFSET,
-    AdtsStream,
     AudioInfo,
     KeyframeIndex,
     LocalMedia,
     MediaInfo,
     SubInfo,
     VideoInfo,
+    VideoSeg,
     adts_packets,
-    audio_chunk_range,
-    audio_chunk_slice,
-    audio_copy_cmd,
-    audio_encode_cmd,
+    audio_frame_range,
+    audio_is_separate,
+    audio_keep_from,
+    audio_only_pipe_cmd,
+    audio_pipe_cmd,
     audio_track_names,
     build_plan,
     direct_play_decision,
-    first_base_time,
-    first_composition_offset,
     hls_audio_is_copy,
     master_playlist,
     media_playlist,
     parse_probe,
     parse_scan,
-    plan_audio_grid,
     plan_video_copy,
     plan_video_grid,
-    set_first_base_time,
+    segment_cmd,
     shift_vtt,
-    split_fmp4,
     video_codec_string,
-    video_copy_cmd,
 )
 
 import downloads
@@ -315,16 +311,10 @@ def test_plan_video_copy_single_keyframe_and_empty():
     assert plan_video_copy(KeyframeIndex((), 0, 0, 0.04)) == []
 
 
-def test_plan_video_grid_and_audio_grid_cover_the_duration():
+def test_plan_video_grid_covers_the_duration():
     grid = plan_video_grid(20.5, 6.0)
     assert [s.start for s in grid] == [0, 6, 12, 18]
     assert sum(s.duration for s in grid) == pytest.approx(20.5)
-    for rate in (48000, 44100, 32000):
-        g = plan_audio_grid(600.0, rate)
-        total = sum(g.seg_duration(k) for k in range(g.count))
-        assert total >= 600.0 and total < 600.0 + AAC_FRAME / rate + 1e-9
-        assert g.frames_per_segment * AAC_FRAME / rate == pytest.approx(6.0, abs=0.03)
-        assert g.seg_frames(0) == g.frames_per_segment
 
 
 # =============================================================================
@@ -337,15 +327,15 @@ def extinf(text: str) -> list[float]:
 
 
 def test_media_playlist_is_a_complete_vod_playlist():
-    text = media_playlist("v/init.mp4", [("v/0.m4s", 5.0), ("v/1.m4s", 6.4), ("v/2.m4s", 1.0)])
+    text = media_playlist([("v/0.ts", 5.0), ("v/1.ts", 6.4), ("v/2.ts", 1.0)])
     lines = text.splitlines()
     assert lines[0] == "#EXTM3U"
     assert lines[-1] == "#EXT-X-ENDLIST"
     assert "#EXT-X-PLAYLIST-TYPE:VOD" in lines
-    assert '#EXT-X-MAP:URI="v/init.mp4"' in lines
+    assert not any(line.startswith("#EXT-X-MAP") for line in lines)  # classic TS, no init
     assert "#EXT-X-TARGETDURATION:7" in lines  # ceil of the longest segment
     assert extinf(text) == [5.0, 6.4, 1.0]
-    assert lines.count("v/1.m4s") == 1
+    assert lines.count("v/1.ts") == 1
 
 
 def test_master_playlist_declares_one_rendition_per_audio_track():
@@ -365,6 +355,14 @@ def test_master_playlist_declares_one_rendition_per_audio_track():
     assert master_playlist(info, "x264").count("avc1.640028") == 1
 
 
+def test_single_audio_track_is_muxed_and_has_no_rendition():
+    info = media("mkv", a=(audio("aac", 0),))
+    assert not audio_is_separate(info)
+    text = master_playlist(info, "copy")
+    assert "#EXT-X-MEDIA" not in text and "AUDIO=" not in text and "mp4a.40.2" in text
+    assert audio_is_separate(media("mkv", a=(audio("aac", 0), audio("aac", 1))))
+
+
 def test_master_playlist_without_audio_has_no_audio_group():
     text = master_playlist(media("mp4"), "copy")
     assert "#EXT-X-MEDIA" not in text and "AUDIO=" not in text
@@ -375,99 +373,6 @@ def test_audio_track_names_are_unique_and_never_empty():
         (audio(lang="eng"), audio(ordinal=1, lang="eng"), audio(ordinal=2, lang=""))
     )
     assert len(set(names)) == 3 and all(names)
-
-
-# =============================================================================
-# fMP4 helpers
-# =============================================================================
-
-
-def box(kind: bytes, payload: bytes) -> bytes:
-    return struct.pack(">I4s", 8 + len(payload), kind) + payload
-
-
-def fake_fragment(base: int, cts_first: int, version: int = 1) -> bytes:
-    tfdt = box(b"tfdt", bytes([1, 0, 0, 0]) + struct.pack(">Q", base))
-    tfhd = box(b"tfhd", bytes([0, 2, 0, 0]) + struct.pack(">I", 1))
-    fmt = ">i" if version else ">I"
-    trun = box(
-        b"trun",
-        bytes([version, 0, 0x0B, 0x00])  # duration + size + cts
-        + struct.pack(">I", 2)
-        + struct.pack(">II", 100, 10) + struct.pack(fmt, cts_first)
-        + struct.pack(">II", 100, 10) + struct.pack(fmt, 0),
-    )  # fmt: skip
-    moof = box(b"moof", box(b"mfhd", bytes(8)) + box(b"traf", tfhd + tfdt + trun))
-    return moof + box(b"mdat", bytes(20))
-
-
-def test_fmp4_helpers_read_and_shift_timestamps():
-    init = box(b"ftyp", b"isom") + box(b"moov", b"x" * 8)
-    data = init + fake_fragment(1000, 1328) + fake_fragment(1200, 0)
-    head, frags = split_fmp4(data)
-    assert head == init
-    assert first_base_time(frags) == 1000
-    assert first_composition_offset(frags) == 1328
-    moved = set_first_base_time(frags, 20000)
-    assert first_base_time(moved) == 20000
-    assert len(moved) == len(frags)
-    # the second fragment keeps its distance to the first one
-    again = set_first_base_time(moved, 1000)
-    assert again == frags
-
-
-def test_fmp4_signed_and_unsigned_composition_offsets():
-    assert first_composition_offset(fake_fragment(0, -672, version=1)) == -672
-    assert first_composition_offset(fake_fragment(0, 672, version=0)) == 672
-    assert first_composition_offset(box(b"mdat", b"")) == 0
-
-
-def test_split_fmp4_rejects_garbage():
-    with pytest.raises(ValueError):
-        split_fmp4(box(b"ftyp", b"isom"))
-    with pytest.raises(ValueError):
-        split_fmp4(b"\x00\x00\x00\xff" + b"moof" + b"\x00" * 3)
-
-
-def test_adts_stream_parses_frames_split_anywhere():
-    def frame(payload: int) -> bytes:
-        length = 7 + payload
-        hdr = bytes(
-            [
-                0xFF,
-                0xF1,
-                0x4C,
-                0x80 | (length >> 11),
-                (length >> 3) & 0xFF,
-                ((length & 7) << 5) | 0x1F,
-                0xFC,
-            ]
-        )
-        return hdr + bytes(payload)
-
-    data = b"".join(frame(n) for n in (10, 300, 5, 40))
-    for step in (1, 3, 7, 50, len(data)):
-        stream = AdtsStream()
-        for i in range(0, len(data), step):
-            stream.feed(data[i : i + step])
-        assert [len(p) for p in stream.packets] == [17, 307, 12, 47], step
-    with pytest.raises(ValueError):
-        AdtsStream().feed(b"\x00" * 20)
-
-
-def test_audio_chunk_range_matches_slice_and_tiles_the_chunk():
-    grid = plan_audio_grid(60.0, 48000)
-    f = grid.frames_per_segment
-    pk = [bytes([i % 251]) * 8 for i in range(4 * f + 10)]
-    for first in (0, 4):
-        stops = []
-        for k in range(first, min(first + 4, grid.count)):
-            start, stop, shift = audio_chunk_range(grid, first, k)
-            assert audio_chunk_slice(pk, grid, first, k) == (pk[start:stop], shift)
-            stops.append((start, stop))
-        # consecutive segments are consecutive packets: no packet lost or repeated
-        for (_, a), (b, _) in zip(stops, stops[1:], strict=False):
-            assert a == b
 
 
 def test_adts_packets_splits_frames():
@@ -507,54 +412,74 @@ def test_shift_vtt_moves_cues_and_keeps_the_rest():
     assert "00:00:00.000 --> 00:00:00.500" in shift_vtt("00:00:00.100 --> 00:00:01.000\n", -0.5)
 
 
-def test_video_copy_cmd_seeks_before_input_and_counts_packets():
+def test_video_copy_segment_is_one_ffmpeg_run_with_native_ts_output():
     info = media("mkv", v=video("hevc"), start=-0.021)
     seg = plan_video_copy(kfs([0.0, 5.0, 10.0], 15.0))[1]
-    cmd = video_copy_cmd("/x/f.mkv", info, seg)
+    cmd = segment_cmd("/x/f.mkv", info, "copy", 0.0, seg, video=True, audio=None)
     assert cmd.index("-ss") < cmd.index("-i")
     assert cmd[cmd.index("-ss") + 1] == "5.021000"  # relative to the container start
-    assert cmd[cmd.index("-frames:v") + 1] == "100"
-    assert "-copypriorss" in cmd and "hvc1" in cmd and "-c:v" in cmd
-    first = video_copy_cmd("/x/f.mkv", media(), plan_video_copy(kfs([0.0, 5.0], 10.0))[0])
+    assert cmd[cmd.index("-frames:v") + 1] == "100"  # video only: exact packet count
+    assert "-copypriorss" in cmd and "-an" in cmd
+    # ffmpeg's own muxer, timeline placed with -output_ts_offset, never with -copyts
+    assert cmd[cmd.index("-output_ts_offset") + 1] == f"{5.0 + TIMELINE_OFFSET:.6f}"
+    assert cmd[cmd.index("-f") + 1] == "mpegts" and "-copyts" not in cmd
+    assert "-movflags" not in cmd and "-tag:v" not in cmd
+    first = segment_cmd(
+        "/x/f.mkv", media(), "copy", 0.0, plan_video_copy(kfs([0.0, 5.0], 10.0))[0],
+        video=True, audio=None,
+    )  # fmt: skip
     assert "-ss" not in first  # segment 0 needs no seek
 
 
-def test_audio_commands_use_frame_exact_grids():
+def test_muxed_segment_limits_video_by_time_and_audio_by_its_own_window():
+    info = media("mkv", a=(audio("aac", channels=2),), start=-0.021)
+    kf = KeyframeIndex(
+        ((0.0, 0), (6.0, 144), (12.0, 288)), 400, 16.0, 1 / 24, (math.nan, 5.917, 11.917)
+    )
+    seg = plan_video_copy(kf)[1]
+    assert seg.span == pytest.approx(11.917 - 6.0 - 1 / 48)
+    cmd = segment_cmd("/x/f.mkv", info, "copy", 0.0, seg, video=True, audio=info.audio[0])
+    assert cmd.count("-i") == 2 and "-frames:v" not in cmd  # -frames:v would cut the audio short
+    assert "-copypriorss" in cmd
+    ts = [cmd[i + 1] for i, c in enumerate(cmd) if c == "-t"]
+    assert ts == [f"{seg.span:.6f}", f"{seg.duration:.6f}"]
+    assert "-map" in cmd and "0:0" in cmd and "1:1" in cmd
+
+
+def test_audio_only_segment_has_no_video_and_same_window():
+    info = media("mkv", a=(audio("aac", 0), audio("aac", 1)))
+    seg = plan_video_copy(kfs([0.0, 5.0, 10.0], 15.0))[1]
+    cmd = segment_cmd("/x/f.mkv", info, "copy", 0.0, seg, video=False, audio=info.audio[1])
+    assert "-vn" in cmd and "0:2" in cmd and cmd.count("-i") == 1
+    assert cmd[cmd.index("-t") + 1] == f"{seg.duration:.6f}"
+    assert cmd[cmd.index("-output_ts_offset") + 1] == f"{5.0 + TIMELINE_OFFSET:.6f}"
+
+
+def test_encoded_audio_uses_the_global_frame_grid_with_lead_in():
     info = media("mkv", a=(audio("ac3", channels=6),), start=-0.02)
     a = info.audio[0]
-    grid = plan_audio_grid(600.0, 48000)
-    cmd = audio_encode_cmd("/x/f.mkv", info, a, grid, 16, 8, 0.0)
-    # priming packet + 2 warm up frames, then the frames of the 8 segments
-    assert cmd[cmd.index("-frames:a") + 1] == str(3 + 8 * grid.frames_per_segment)
-    assert "-ac" in cmd and cmd[cmd.index("-ac") + 1] == "2"  # 5.1 is downmixed
+    f0, f1 = audio_frame_range(6.0, 12.0)
+    assert f0 == math.ceil(6.0 * 48000 / AAC_FRAME) and f1 == math.ceil(12.0 * 48000 / AAC_FRAME)
+    cmd = audio_pipe_cmd("/x/f.mkv", info, a, 0.0, f0, f1 - f0)
+    assert cmd[cmd.index("-frames:a") + 1] == str(2 + 1 + f1 - f0)  # lead + priming + frames
+    assert cmd[cmd.index("-ac") + 1] == "2" and cmd[cmd.index("-profile:a") + 1] == "aac_low"
     seek = float(cmd[cmd.index("-ss") + 1])
-    start = 16 * grid.frames_per_segment * AAC_FRAME / 48000
-    assert seek == pytest.approx(0.02 + start - 2 * AAC_FRAME / 48000)
-    first_chunk = audio_encode_cmd("/x/f.mkv", info, a, grid, 0, 8, 0.0)
-    assert first_chunk[first_chunk.index("-frames:a") + 1] == str(1 + 8 * grid.frames_per_segment)
-    copy_cmd = audio_copy_cmd("/x/f.mkv", info, audio("aac"), grid, 2)
-    assert "copy" in copy_cmd and copy_cmd[copy_cmd.index("-frames:a") + 1] == str(
-        grid.frames_per_segment
+    assert seek == pytest.approx(0.02 + f0 * AAC_FRAME / 48000 - 2 * AAC_FRAME / 48000)
+    assert audio_keep_from(f0) == 3 and audio_keep_from(0) == 0
+    assert audio_frame_range(0.0, 6.0)[0] == 0
+    # windows tile the timeline: the next window starts on the frame this one stops at
+    assert audio_frame_range(12.0, 18.0)[0] == f1
+
+
+def test_segments_share_one_timeline_offset_formula():
+    info = media("mkv", a=(audio("ac3"),))
+    seg = VideoSeg(18.0, 6.0, 18.0, 144)
+    mux = segment_cmd(
+        "/x/f.mkv", info, "copy", 0.0, seg, video=True, audio=info.audio[0], piped_audio_shift=0.01
     )
-
-
-def test_audio_chunk_slice_maps_segments_to_packets():
-    grid = plan_audio_grid(30.0, 48000)  # 5 segments, the last one shorter
-    f = grid.frames_per_segment
-    assert grid.count == 6 and grid.seg_frames(5) < f
-    pk = [bytes([i % 256]) * 8 for i in range(3 * f + 10)]
-    # chunk starting at segment 0: priming packet first, segment 0 carries it
-    seg0, shift0 = audio_chunk_slice(pk, grid, 0, 0)
-    assert seg0 == pk[: f + 1] and shift0 == -AAC_FRAME
-    seg1, shift1 = audio_chunk_slice(pk, grid, 0, 1)
-    assert seg1 == pk[f + 1 : 2 * f + 1] and shift1 == 0
-    # chunk starting later: 3 lead in packets (priming + 2 warm up) are skipped
-    seg3, shift3 = audio_chunk_slice(pk, grid, 3, 3)
-    assert seg3 == pk[3 : 3 + f] and shift3 == 0
-    seg4, _ = audio_chunk_slice(pk, grid, 3, 4)
-    assert seg4 == pk[3 + f : 3 + 2 * f]
-    last, _ = audio_chunk_slice(pk[: 3 + 2 * f + 5], grid, 3, 5)
-    assert len(last) == 5 or len(last) == grid.seg_frames(5)
+    assert mux[mux.index("-itsoffset") + 1] == "0.010000" and "pipe:0" in mux
+    only = audio_only_pipe_cmd(18.005, seg)
+    assert only[only.index("-output_ts_offset") + 1] == f"{18.005 + TIMELINE_OFFSET:.6f}"
 
 
 # =============================================================================
@@ -662,7 +587,7 @@ def probe_json(path: Path, *args: str) -> list[list[str]]:
 
 
 def fetch_all(client: TestClient, did: str, variant: str, out: Path) -> dict[str, Any]:
-    """Download the master, every playlist, init and segment into ``out``; returns stats."""
+    """Download the master, every playlist and segment into ``out``; returns stats."""
     base = f"/local/{did}/{variant}"
     master = client.get(f"{base}/master.m3u8")
     assert master.status_code == 200, master.text
@@ -673,10 +598,10 @@ def fetch_all(client: TestClient, did: str, variant: str, out: Path) -> dict[str
         text = client.get(f"{base}/{name}").text
         (out / name).write_text(text)
         stats["playlists"][name] = text
-        init = re.search(r'#EXT-X-MAP:URI="([^"]+)"', text).group(1)  # type: ignore[union-attr]
-        for uri in [init, *[m for m in re.findall(r"^([^#].*\.m4s)$", text, re.M)]]:
+        for uri in re.findall(r"^([^#].*\.ts)$", text, re.M):
             r = client.get(f"{base}/{uri}")
             assert r.status_code == 200, (uri, r.status_code)
+            assert r.headers["content-type"] == "video/mp2t"
             (out / uri).parent.mkdir(parents=True, exist_ok=True)
             (out / uri).write_bytes(r.content)
     return stats
@@ -686,11 +611,15 @@ HLS_ARGS = ["-allowed_extensions", "ALL", "-protocol_whitelist", "file,crypto,da
 
 
 def decode_clean(playlist: Path) -> str:
+    """Decode warnings, minus the MPEG-TS continuity counter notice: every independently cut
+    segment starts its counters at 0 (as in any on demand TS packager), which the ffmpeg hls
+    demuxer reports at each join; players do not care."""
     r = subprocess.run(
         ["ffmpeg", "-nostdin", "-v", "warning", *HLS_ARGS, "-i", str(playlist), "-f", "null", "-"],
         capture_output=True, text=True, timeout=120,
     )  # fmt: skip
-    return r.stderr.strip()
+    ignored = ("Packet corrupt", "corrupt input packet", "discontinuity")
+    return "\n".join(x for x in r.stderr.splitlines() if not any(i in x for i in ignored)).strip()
 
 
 def packet_times(playlist: Path, stream: str) -> list[float]:
@@ -756,14 +685,15 @@ def test_complete_vod_playlists_and_gapless_segments(env, tmp_path: Path, did: s
     assert max(steps) < 0.1 and min(steps) > 0
     assert len(times) == DURATION * 24  # every source frame, RASL leading pictures included
 
-    # audio: contiguous AAC frames from the very same origin
-    for name in stats["playlists"]:
-        if name == "v.m3u8":
-            continue
+    # audio (muxed into v.m3u8, or one audio-only rendition per track): contiguous AAC frames
+    # from the very same origin
+    names = [n for n in stats["playlists"] if n != "v.m3u8"] or ["v.m3u8"]
+    for name in names:
         atimes = packet_times(tmp_path / name, "a:0")
         astep = [b - a for a, b in zip(atimes, atimes[1:], strict=False)]
         assert atimes[0] == pytest.approx(TIMELINE_OFFSET, abs=0.05)
         assert max(astep) < 0.0235 and min(astep) > 0.0205, name  # 1024 samples at 44.1/48 kHz
+        assert atimes[-1] > DURATION + TIMELINE_OFFSET - 0.1, name
 
 
 @needs_ffmpeg
@@ -777,9 +707,9 @@ def test_multi_audio_master_has_one_rendition_per_track(env):
     for uri in ("a0.m3u8", "a1.m3u8"):
         assert client.get(f"/local/multi/copy/{uri}").status_code == 200
     assert client.get("/local/multi/copy/a2.m3u8").status_code == 404
-    assert client.get("/local/multi/copy/a2/0.m4s").status_code == 404
-    assert client.get("/local/multi/copy/a0/9999.m4s").status_code == 404
-    assert client.get("/local/multi/copy/v/9999.m4s").status_code == 404
+    assert client.get("/local/multi/copy/a2/0.ts").status_code == 404
+    assert client.get("/local/multi/copy/a0/9999.ts").status_code == 404
+    assert client.get("/local/multi/copy/v/9999.ts").status_code == 404
 
 
 @needs_ffmpeg
@@ -803,18 +733,14 @@ def read_pcm(playlist_or_file: Path, *extra: str) -> array.array:
 
 
 @needs_ffmpeg
-def test_encoded_audio_segments_join_without_audible_seams(
-    env, media_dir: Path, tmp_path: Path, monkeypatch
-):
-    """Encoded AAC must decode like one continuous stream, also across chunk joins."""
-    monkeypatch.setattr(local_media, "AUDIO_CHUNK_SEGMENTS", 2)  # chunk joins at segment 2
-    client, _ = env
+def test_encoded_audio_segments_join_without_audible_seams(env, media_dir: Path, tmp_path: Path):
+    """Independently encoded AAC segments must decode like one continuous stream."""
+    client, svc = env
     fetch_all(client, "ac3", "copy", tmp_path)
-    got = read_pcm(tmp_path / "a0.m3u8", *HLS_ARGS)
+    got = read_pcm(tmp_path / "v.m3u8", *HLS_ARGS)
     want = read_pcm(media_dir / "ac3.mkv")
-    n = min(len(got), len(want)) - 6000
-    assert n > 40 * 1024
-    seg = 281 * AAC_FRAME
+    assert len(got) > 40 * 1024
+    pres = asyncio.run(svc.presentation(media_dir / "ac3.mkv", "copy"))
 
     def mse(lo: int, hi: int, shift: int, step: int = 1) -> float:
         return sum((got[i + shift] - want[i]) ** 2 for i in range(lo, hi, step)) / len(
@@ -824,24 +750,26 @@ def test_encoded_audio_segments_join_without_audible_seams(
     def best(lo: int, around: int, span: int) -> int:
         return min(range(around - span, around + span + 1), key=lambda s: mse(lo, lo + 1500, s, 3))
 
-    # one alignment for the whole track (source noise makes it unambiguous) ...
     shift = min(range(-4000, 4000), key=lambda s: mse(30000, 30600, s, 3))
     power = sum(w * w for w in want[30000:60000:5]) / 6000
     assert mse(30000, 60000, shift, 5) < 0.02 * power  # codec noise only (white noise: worst case)
-    # chunk 1 (segments 2 and 3) is a separate encode: it may sit a few samples off chunk 0
-    # (Matroska timestamps are rounded to 1 ms, a seek lands on those), but never by more
-    other = best(2 * seg + 3000, shift, 40)
-    assert abs(other - shift) <= 32, other - shift
-    assert mse(2 * seg + 3000, 2 * seg + 4500, other) < 0.1 * power
-    # ... and inside a chunk (joins at segments 1 and 3) the offset does not move at all: no
-    # missing or repeated sample, no click
-    for join, ref in ((seg, shift), (3 * seg, other)):
-        for lo in (join - 3200, join - 1700, join + 200, join + 3000):
-            assert best(lo, ref, 2) == ref, (join, lo)
-            assert mse(lo, lo + 1500, ref) < 0.1 * power, (join, lo)
-    # the alignment is absolute: same origin as the timeline the video uses
-    first = packet_times(tmp_path / "a0.m3u8", "a:0")[0]
-    assert first == pytest.approx(TIMELINE_OFFSET - AAC_FRAME / 48000, abs=0.002)  # priming frame
+    # Matroska timestamps are rounded to 1 ms, and each segment is encoded from its own seek:
+    # a segment may sit a few samples (< 1 ms) off its neighbour, never more, and it is
+    # internally exact (no missing or repeated sample, no click inside a segment); the frame
+    # of the join itself is the only one allowed to differ
+    for k in range(1, min(4, len(pres.video))):
+        join = round(pres.video[k].start * 48000)
+        after = best(join + 3000, shift, 40)
+        assert abs(after - shift) <= 32, (k, after - shift)
+        for lo in (join + 3000, join + 4500, join + 6000):
+            assert best(lo, after, 2) == after, (k, lo)
+            assert mse(lo, lo + 1500, after) < 0.1 * power, (k, lo)
+        for lo in (join - 6000, join - 3000, join - 1700):
+            assert best(lo, shift, 2) == shift, (k, lo)
+            assert mse(lo, lo + 1500, shift) < 0.1 * power, (k, lo)
+        shift = after
+    first = packet_times(tmp_path / "v.m3u8", "a:0")[0]
+    assert first == pytest.approx(TIMELINE_OFFSET, abs=0.03)  # same origin as the video
 
 
 @needs_ffmpeg
@@ -874,7 +802,7 @@ def test_random_seeks_are_answered_from_independent_segments(env):
     lat = []
     for k in order:
         t = time.perf_counter()
-        r = client.get(f"/local/multi/copy/v/{k}.m4s")
+        r = client.get(f"/local/multi/copy/v/{k}.ts")
         lat.append(time.perf_counter() - t)
         assert r.status_code == 200 and len(r.content) > 1000
     # each distinct segment is produced exactly once, order and repetition do not matter
@@ -890,37 +818,33 @@ def test_concurrent_requests_share_one_ffmpeg_run(env):
     from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(8) as pool:
-        results = list(pool.map(lambda _: client.get("/local/ac3/copy/v/2.m4s"), range(8)))
+        results = list(pool.map(lambda _: client.get("/local/ac3/copy/v/2.ts"), range(8)))
     assert all(r.status_code == 200 for r in results)
     assert len({r.content for r in results}) == 1
-    assert svc.ffmpeg_runs - before == 1
+    assert svc.ffmpeg_runs - before == 2  # audio encode + TS mux, once for the 8 requests
 
 
 @needs_ffmpeg
-def test_encoded_audio_segments_of_a_chunk_share_one_encode(env):
+def test_audio_only_renditions_are_one_ffmpeg_run_and_cached(env):
     client, svc = env
-    client.get("/local/ac3/copy/a0.m3u8")
+    client.get("/local/multi/copy/a0.m3u8")
     before = svc.ffmpeg_runs
-    from concurrent.futures import ThreadPoolExecutor
-
-    with ThreadPoolExecutor(4) as pool:
-        results = list(pool.map(lambda k: client.get(f"/local/ac3/copy/a0/{k}.m4s"), range(4)))
+    results = [client.get(f"/local/multi/copy/a1/{k}.ts") for k in range(3)]
     assert all(r.status_code == 200 and len(r.content) > 1000 for r in results)
-    # 1 chunk encode + 1 decoder config + 4 cheap muxes: not one encode per segment
-    assert svc.ffmpeg_runs - before == 6
-    assert list((svc.root).glob("*/*/a0/c0.adts"))  # the chunk is cached for later seeks
+    assert svc.ffmpeg_runs - before == 3  # copied AAC: one short run per segment
     runs = svc.ffmpeg_runs
-    assert client.get("/local/ac3/copy/a0/2.m4s").status_code == 200
+    assert client.get("/local/multi/copy/a1/2.ts").status_code == 200
     assert svc.ffmpeg_runs == runs
+    assert client.get("/local/plain/copy/a0.m3u8").status_code == 404  # one track: muxed
 
 
 @needs_ffmpeg
 def test_segments_are_served_from_cache_the_second_time(env):
     client, svc = env
     client.get("/local/plain/copy/v.m3u8")
-    assert client.get("/local/plain/copy/v/1.m4s").status_code == 200
+    assert client.get("/local/plain/copy/v/1.ts").status_code == 200
     runs = svc.ffmpeg_runs
-    assert client.get("/local/plain/copy/v/1.m4s").status_code == 200
+    assert client.get("/local/plain/copy/v/1.ts").status_code == 200
     assert svc.ffmpeg_runs == runs
 
 
@@ -935,11 +859,11 @@ def test_cache_is_trimmed_to_its_limit(media_dir: Path, tmp_path: Path):
         async def run() -> int:
             pres = await svc.presentation(path, "copy")
             for k in range(len(pres.video)):
-                await svc.video_segment(pres, k)
+                await svc.segment(pres, None, k)
             return svc.trim_cache()
 
         assert asyncio.run(run()) > 0
-        left = list((tmp_path / "c").glob("*/*/*/*.m4s"))
+        left = list((tmp_path / "c").glob("*/*/*/*.ts"))
         assert left == [] or len(left) < 4
         assert list((tmp_path / "c").glob("*/keyframes.json"))  # the small index survives
     finally:
@@ -971,7 +895,7 @@ def test_only_finished_downloads_are_served(env):
     for url in (
         "/api/local/busy/plan",
         "/local/busy/copy/master.m3u8",
-        "/local/busy/copy/v/0.m4s",
+        "/local/busy/copy/v/0.ts",
         "/local/busy/sub/0.vtt",
     ):
         assert client.get(url).status_code == 409, url
@@ -986,8 +910,8 @@ def test_paths_never_come_from_the_request(env):
     for did in ("..%2Fplain", "..%2Fplain.mp4", "%2Fetc%2Fpasswd", "plain.mp4", "%2e%2e%2fplain"):
         assert client.get(f"/api/local/{did}/plan").status_code in (404, 405, 422), did
         assert client.get(f"/local/{did}/copy/master.m3u8").status_code in (404, 405, 422), did
-    assert client.get("/local/plain/copy/v/-1.m4s").status_code in (404, 422)
-    assert client.get("/local/plain/copy/v/abc.m4s").status_code == 422
+    assert client.get("/local/plain/copy/v/-1.ts").status_code in (404, 422)
+    assert client.get("/local/plain/copy/v/abc.ts").status_code == 422
 
 
 def test_router_requires_authentication():
@@ -1003,8 +927,8 @@ def test_router_requires_authentication():
             "/api/local/x/plan",
             "/local/x/copy/master.m3u8",
             "/local/x/copy/v.m3u8",
-            "/local/x/copy/v/0.m4s",
-            "/local/x/copy/a0/0.m4s",
+            "/local/x/copy/v/0.ts",
+            "/local/x/copy/a0/0.ts",
             "/local/x/sub/0.vtt",
         ):
             assert client.get(url).status_code == 401, url
@@ -1097,12 +1021,6 @@ def test_transcode_start_still_refuses_files_outside_the_download_folder(page_cl
 # --------------------------------------------------------------------------- regression: audio sync
 
 
-def test_audio_copy_drops_packets_before_the_seek_time():
-    grid = plan_audio_grid(600.0, 48000)
-    cmd = audio_copy_cmd("/x/f.mkv", media("mkv", a=(audio("aac"),)), audio("aac"), grid, 2)
-    assert cmd[cmd.index("-copypriorss") + 1] == "0"
-
-
 def _dominant_hz(pcm: bytes, rate: int) -> float:
     """Frequency of a pure sweep over a short window, from its zero crossings."""
     samples = array.array("f", pcm)
@@ -1128,19 +1046,98 @@ def test_copied_audio_segments_hold_the_audio_of_their_own_time(tmp_path: Path):
         lm = LocalMedia(cache_root=tmp_path / "cache", max_bytes=1 << 30)
         pres = await lm.presentation(src, "copy")
         out = []
-        for k in (3, 5, 8):  # 18 s, 30 s, 48 s: inside a GOP, not on a cue
-            seg = await lm.audio_segment(pres, 0, k)
-            joined = tmp_path / f"a{k}.mp4"
-            joined.write_bytes((seg.parent / "init.mp4").read_bytes() + seg.read_bytes())
+        for k in (1, 3, 5):  # 10 s GOPs: segments start on keyframes far from the file start
+            seg = await lm.segment(pres, None, k)
             raw = subprocess.run(
-                ["ffmpeg", "-v", "error", "-i", str(joined), "-t", "0.3", "-ac", "1",
+                ["ffmpeg", "-v", "error", "-i", str(seg), "-map", "0:a", "-t", "0.3", "-ac", "1",
                  "-ar", "48000", "-f", "f32le", "-"],
                 capture_output=True, check=True,
             ).stdout  # fmt: skip
-            start = pres.audio_grids[0].seg_start_samples(k) / 48000
+            start = pres.video[k].start
             out.append((start, (_dominant_hz(raw, 48000) - 200) / 40))
         return out
 
     # the 0.3 s window is centered 0.15 s after the segment start; the old bug was 1 to 2 s off
     for claimed, heard in asyncio.run(run()):
         assert heard == pytest.approx(claimed + 0.15, abs=0.1), (claimed, heard)
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("did,variant", [("plain", "copy"), ("multi", "copy"), ("ac3", "copy"),
+                                         ("hevc", "copy"), ("plain", "x264")])  # fmt: skip
+def test_segments_continue_each_other_and_start_aligned(
+    env, tmp_path: Path, did: str, variant: str
+):
+    """Independently cut segments form one timeline: the first pts of every segment is the
+    sum of the previous durations (plus the shared offset), and in every segment audio and
+    video start within one AAC frame of each other."""
+    client, _ = env
+    stats = fetch_all(client, did, variant, tmp_path)
+    durs = extinf(stats["playlists"]["v.m3u8"])
+    starts = [TIMELINE_OFFSET + sum(durs[:k]) for k in range(len(durs))]
+    for name, text in stats["playlists"].items():
+        uris = re.findall(r"^([^#].*\.ts)$", text, re.M)
+        prev_end: dict[str, float] = {}
+        for k, uri in enumerate(uris):
+            rows = probe_json(
+                tmp_path / uri, "-show_entries", "packet=codec_type,pts_time,duration_time"
+            )
+            first: dict[str, float] = {}
+            end: dict[str, float] = {}
+            for kind, pts, dur, *_ in rows:
+                t = float(pts)
+                first[kind] = min(first.get(kind, t), t)
+                end[kind] = max(end.get(kind, 0.0), t + float(dur))
+            for kind, t in first.items():
+                if kind == "video" or name != "v.m3u8":
+                    # open GOP leading pictures are shown before their keyframe
+                    lead = 0.25 if kind == "video" and did == "hevc" else 0.0
+                    hi = starts[k] + (0.001 if kind == "video" else 0.03)
+                    assert starts[k] - lead - 0.001 <= t <= hi, (name, k, kind, t, starts[k])
+                if kind in prev_end:  # no gap, no overlap with the previous segment
+                    assert abs(t - prev_end[kind]) < (0.25 if did == "hevc" else 0.0235), (
+                        name,
+                        k,
+                        kind,
+                    )
+                prev_end[kind] = end[kind]
+            if "video" in first and "audio" in first:
+                assert abs(first["audio"] - first["video"]) <= (0.3 if did == "hevc" else 0.0435), (
+                    name,
+                    k,
+                )
+
+
+@needs_ffmpeg
+def test_encoded_audio_sits_at_its_absolute_source_time(env, media_dir: Path, tmp_path: Path):
+    """The pts of a segment's first audio packet is where its samples belong in the source:
+    an encoded segment (ac3 -> aac) decoded and compared with the source at that time."""
+    client, _ = env
+    full = read_pcm(media_dir / "ac3.mkv")
+    astart = float(
+        probe_json(
+            media_dir / "ac3.mkv", "-select_streams", "a:0", "-show_entries", "stream=start_time"
+        )[0][0]
+    )
+    for k in (0, 2, 3):
+        r = client.get(f"/local/ac3/copy/v/{k}.ts")
+        assert r.status_code == 200
+        seg = tmp_path / f"{k}.ts"
+        seg.write_bytes(r.content)
+        rows = probe_json(seg, "-select_streams", "a:0", "-show_entries", "packet=pts_time")
+        first = min(float(x[0]) for x in rows)
+        got = read_pcm(seg)
+        skip = 3000  # priming block (segment 0) and first overlap-add block
+        n = 6000
+        base = round(
+            (first - TIMELINE_OFFSET - astart) * 48000
+        )  # source sample of the first packet
+
+        def err(lag: int, got=got, base=base, skip=skip, n=n) -> float:
+            return sum((got[skip + i] - full[base + skip + i + lag]) ** 2 for i in range(0, n, 3))
+
+        best = min(range(-150, 151), key=err)
+        assert abs(best) <= 60, (
+            k,
+            best,
+        )  # 1 ms is 48 samples; the truth is 0 up to timestamp rounding
