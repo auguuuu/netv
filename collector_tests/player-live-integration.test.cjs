@@ -154,7 +154,7 @@ async function player({
       return { ok: true, json: async () => data };
     },
   });
-  for (const script of ['live-playback.js', 'player.js']) {
+  for (const script of ['live-playback.js', 'player-tracks.js', 'player.js']) {
     runInContext(readFileSync(join(__dirname, '../static/js', script), 'utf8'), context);
   }
   await flush();

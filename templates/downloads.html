@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Téléchargements - neTV{% endblock %}
+
+{% block content %}
+<div class="flex flex-col h-full min-h-0 min-w-0">
+  <div class="flex flex-wrap items-end justify-between gap-2 mb-4">
+    <h2 class="text-xl sm:text-3xl font-bold">Téléchargements</h2>
+    <div class="text-sm text-gray-400 text-right min-w-0">
+      <div>Dossier : <span id="dl-dir" class="text-gray-200 break-all">…</span></div>
+      <div>Espace libre : <span id="dl-free" class="text-gray-200">…</span></div>
+    </div>
+  </div>
+
+  <div id="dl-error" class="hidden mb-4 rounded bg-red-900/50 border border-red-700 px-3 py-2 text-sm">
+    Impossible de charger la liste des téléchargements.
+  </div>
+
+  <div class="flex-1 min-h-0 overflow-auto scroll-ring-safe">
+    <div id="dl-empty" class="hidden text-center text-gray-400 py-12">
+      <p class="text-xl mb-2">Aucun téléchargement</p>
+      <p>Utilisez le bouton de téléchargement sur un film ou un épisode pour l'ajouter ici.</p>
+    </div>
+    <ul id="dl-list" class="space-y-2 pb-4"></ul>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/downloads-page.js"></script>
+{% endblock %}

@@ -10,6 +10,11 @@
   const error = document.getElementById('error');
   const ccBtn = document.getElementById('toggle-cc');
   const settingsMenu = document.getElementById('settings-menu');
+  const audioBtn = document.getElementById('toggle-audio');
+  const audioMenu = document.getElementById('audio-menu');
+  const ccMenu = document.getElementById('cc-menu');
+  const Tracks = window.NetvTracks;
+  const AUDIO_LANG_KEY = 'playerAudioLang';
 
   // State
   let transcodeSessionId = null;
@@ -23,6 +28,7 @@
   let seekOffset = 0;
   let currentSubtitles = null;
   let activeTrackStates = null;
+  let ccSelectedIdx = null; // explicit user pick in the CC menu, null = automatic
   let progressPollTimerId = null;
   let lastSavedPosition = 0;
   let savePositionTimeout = null;
@@ -296,6 +302,7 @@
         }
       }
     }
+    if (ccSelectedIdx !== null && ccSelectedIdx < tracks.length) preferredIdx = ccSelectedIdx;
     tracks.forEach((t, i) => t.mode = i === preferredIdx ? 'showing' : 'hidden');
   }
 
@@ -324,6 +331,7 @@
         retryCount: 0,
       }));
     }
+    if (ccSelectedIdx !== null && ccSelectedIdx < activeTrackStates.length) prefIdx = ccSelectedIdx;
     activeTrackStates.forEach((ts, i) => {
       ts.track.mode = (ccEnabled && i === prefIdx) ? 'showing' : 'hidden';
     });
@@ -626,6 +634,9 @@
     seekOffset = 0;
     currentSubtitles = null;
     activeTrackStates = null;
+    ccSelectedIdx = null;
+    closeTrackMenus();
+    updateAudioButton();
     document.getElementById('menu-jump')?.classList.add('hidden');
     document.getElementById('seek-container').classList.add('hidden');
     await transcodeSession.stop();
@@ -769,6 +780,7 @@
         error.classList.add('hidden');
         if (video.textTracks.length === 0) disableCcButton();
         applyCaptionsSetting();
+        setupNativeAudioTracks();
         restorePosition();
         if (transcodeSessionId && !adaptiveSession) startProgressPolling();
         video.play().catch(() => { if (!video.muted) { autoMutedByPolicy = true; video.muted = true; } video.play(); });
@@ -852,7 +864,21 @@
       }, 1000);
     });
 
+    let audioAutoSelected = false;
+    const onAudioTracks = () => {
+      if (!audioAutoSelected && hls.audioTracks?.length > 1) {
+        audioAutoSelected = true;
+        const idx = Tracks.findAudioByLang(hls.audioTracks, loadSavedAudioLang());
+        if (idx >= 0 && idx !== hls.audioTrack) hls.audioTrack = idx;
+      }
+      updateAudioButton();
+    };
+    hls.on(Hls.Events.AUDIO_TRACKS_UPDATED, onAudioTracks);
+    hls.on(Hls.Events.AUDIO_TRACK_SWITCHED, () => updateAudioButton());
+    hls.on(Hls.Events.MANIFEST_PARSED, onAudioTracks);
+
     hls.on(Hls.Events.SUBTITLE_TRACKS_UPDATED, () => {
+      refreshOpenMenu();
       if (hls.subtitleTracks.length > 0 && ccBtn.disabled) {
         enableCcButton();
         if (cfg.captionsEnabled) hls.subtitleTrack = getPreferredSubtitleTrack(hls.subtitleTracks);
@@ -903,6 +929,234 @@
   }
 
   // ============================================================
+  // Audio and subtitle menus
+  // ============================================================
+
+  const TRACK_MENUS = {
+    audio: { btn: audioBtn, menu: audioMenu, title: 'Audio' },
+    cc: { btn: ccBtn, menu: ccMenu, title: 'Sous-titres' },
+  };
+
+  function anyMenuOpen() {
+    return settingsMenu.classList.contains('open') ||
+      audioMenu.classList.contains('open') || ccMenu.classList.contains('open');
+  }
+
+  function openMenuKind() {
+    return Object.keys(TRACK_MENUS).find(k => TRACK_MENUS[k].menu.classList.contains('open')) || null;
+  }
+
+  function loadSavedAudioLang() {
+    try { return localStorage.getItem(AUDIO_LANG_KEY) || ''; } catch { return ''; }
+  }
+
+  function saveAudioLang(lang) {
+    try { localStorage.setItem(AUDIO_LANG_KEY, lang); } catch { /* storage unavailable */ }
+  }
+
+  // Audio tracks from hls.js, or from the native API (Safari) as a fallback.
+  function getAudioTracks() {
+    if (currentHls && currentHls.audioTracks && currentHls.audioTracks.length > 0) {
+      const active = currentHls.audioTrack;
+      return currentHls.audioTracks.map((t, i) => ({
+        idx: i, lang: t.lang, name: t.name, active: i === active,
+        label: Tracks.trackLabel(t.lang, t.name, `Piste ${i + 1}`),
+      }));
+    }
+    const native = video.audioTracks;
+    if (native && native.length > 0) {
+      return Array.from(native).map((t, i) => ({
+        idx: i, lang: t.language, name: t.label, active: !!t.enabled,
+        label: Tracks.trackLabel(t.language, t.label, `Piste ${i + 1}`),
+      }));
+    }
+    return [];
+  }
+
+  function updateAudioButton() {
+    const show = getAudioTracks().length >= 2;
+    audioBtn.classList.toggle('hidden', !show);
+    if (!show && audioMenu.classList.contains('open')) closeTrackMenus();
+    refreshOpenMenu();
+  }
+
+  function setupNativeAudioTracks() {
+    const native = video.audioTracks;
+    if (!native || currentHls) return;
+    updateAudioButton();
+    if (native.addEventListener) {
+      native.addEventListener('addtrack', updateAudioButton);
+      native.addEventListener('removetrack', updateAudioButton);
+    }
+    const tracks = getAudioTracks();
+    const idx = Tracks.findAudioByLang(tracks, loadSavedAudioLang());
+    if (tracks.length > 1 && idx >= 0 && !tracks[idx].active) selectAudio(idx, false);
+  }
+
+  function selectAudio(idx, persist = true) {
+    const tracks = getAudioTracks();
+    const track = tracks[idx];
+    if (!track) return;
+    if (currentHls && currentHls.audioTracks && currentHls.audioTracks.length > 0) {
+      currentHls.audioTrack = idx;
+    } else if (video.audioTracks) {
+      Array.from(video.audioTracks).forEach((t, i) => { t.enabled = i === idx; });
+    }
+    if (persist) {
+      const key = Tracks.langKey(track);
+      if (key) saveAudioLang(key);
+    }
+    updateAudioButton();
+  }
+
+  function getCcTracks() {
+    const tracks = [];
+    if (activeTrackStates?.length > 0) {
+      activeTrackStates.forEach((ts, i) => tracks.push({ idx: i, lang: ts.track.language, name: ts.track.label }));
+    } else if (currentHls?.subtitleTracks?.length > 0) {
+      currentHls.subtitleTracks.forEach((t, i) => tracks.push({ idx: i, lang: t.lang, name: t.name }));
+    } else {
+      Array.from(video.textTracks).filter(t => t.kind === 'subtitles' || t.kind === 'captions')
+        .forEach((t, i) => tracks.push({ idx: i, lang: t.language, name: t.label }));
+    }
+    return tracks.map(t => ({ ...t, label: Tracks.trackLabel(t.lang, t.name, `Piste ${t.idx + 1}`) }));
+  }
+
+  // Index of the subtitle track currently shown, -1 when subtitles are off.
+  function getActiveCcIdx() {
+    if (!ccEnabled) return -1;
+    if (activeTrackStates?.length > 0) return activeTrackStates.findIndex(ts => ts.track.mode === 'showing');
+    if (currentHls?.subtitleTracks?.length > 0 && currentHls.subtitleTrack >= 0) return currentHls.subtitleTrack;
+    const tracks = Array.from(video.textTracks).filter(t => t.kind === 'subtitles' || t.kind === 'captions');
+    return tracks.findIndex(t => t.mode === 'showing');
+  }
+
+  function setCcTrack(idx) {
+    // idx -1 means subtitles off
+    ccEnabled = idx >= 0;
+    ccSelectedIdx = idx >= 0 ? idx : ccSelectedIdx;
+    const filtered = () => Array.from(video.textTracks).filter(t => t.kind === 'subtitles' || t.kind === 'captions');
+    if (activeTrackStates?.length > 0) {
+      activeTrackStates.forEach((ts, i) => ts.track.mode = i === idx ? 'showing' : 'hidden');
+    } else {
+      if (currentHls?.subtitleTracks?.length > 0) {
+        currentHls.subtitleDisplay = ccEnabled;
+        currentHls.subtitleTrack = idx;
+      }
+      // iOS: also set TextTrack.mode directly (HLS.js property change doesn't always trigger render)
+      filtered().forEach((t, i) => t.mode = i === idx ? 'showing' : 'hidden');
+    }
+    updateCcButton();
+    saveSettings({ ccEnabled });
+  }
+
+  function menuEntries(kind) {
+    if (kind === 'audio') {
+      return getAudioTracks().map(t => ({ label: t.label, checked: t.active, onSelect: () => selectAudio(t.idx) }));
+    }
+    const active = getActiveCcIdx();
+    const entries = [{ label: 'Désactivés', checked: active < 0, onSelect: () => setCcTrack(-1) }];
+    getCcTracks().forEach(t => entries.push({ label: t.label, checked: t.idx === active, onSelect: () => setCcTrack(t.idx) }));
+    return entries;
+  }
+
+  function renderTrackMenu(kind) {
+    const { menu } = TRACK_MENUS[kind];
+    menu.textContent = '';
+    for (const entry of menuEntries(kind)) {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'settings-item';
+      item.setAttribute('role', 'menuitemradio');
+      item.setAttribute('aria-checked', entry.checked ? 'true' : 'false');
+      const check = document.createElement('span');
+      check.className = 'settings-check';
+      check.textContent = entry.checked ? '✓' : '';
+      item.appendChild(check);
+      item.appendChild(document.createTextNode(entry.label));
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        entry.onSelect();
+        closeTrackMenus();
+      });
+      menu.appendChild(item);
+    }
+  }
+
+  function refreshOpenMenu() {
+    const kind = openMenuKind();
+    if (!kind) return;
+    const menu = TRACK_MENUS[kind].menu;
+    const focusedIdx = Array.from(menu.children).indexOf(document.activeElement);
+    renderTrackMenu(kind);
+    if (focusedIdx >= 0) menu.children[focusedIdx]?.focus();
+  }
+
+  function closeTrackMenus(refocus = false) {
+    const kind = openMenuKind();
+    for (const k of Object.keys(TRACK_MENUS)) {
+      TRACK_MENUS[k].menu.classList.remove('open');
+      TRACK_MENUS[k].btn.setAttribute('aria-expanded', 'false');
+    }
+    if (kind && refocus) TRACK_MENUS[kind].btn.focus();
+  }
+
+  function toggleTrackMenu(kind) {
+    const wasOpen = TRACK_MENUS[kind].menu.classList.contains('open');
+    closeTrackMenus();
+    settingsMenu.classList.remove('open');
+    if (wasOpen) return;
+    const { btn, menu } = TRACK_MENUS[kind];
+    renderTrackMenu(kind);
+    menu.classList.add('open');
+    btn.setAttribute('aria-expanded', 'true');
+    document.getElementById('player-container').classList.add('controls-visible');
+    const items = Array.from(menu.children);
+    (items.find(i => i.getAttribute('aria-checked') === 'true') || items[0])?.focus();
+  }
+
+  // Keyboard navigation inside an open track menu. Returns true when the key was consumed.
+  function handleTrackMenuKey(e) {
+    const kind = openMenuKind();
+    if (!kind) return false;
+    const menu = TRACK_MENUS[kind].menu;
+    const items = Array.from(menu.children);
+    const cur = items.indexOf(document.activeElement);
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault();
+        items[cur < 0 ? 0 : (cur + 1) % items.length]?.focus();
+        return true;
+      case 'ArrowUp':
+        e.preventDefault();
+        items[cur < 0 ? items.length - 1 : (cur - 1 + items.length) % items.length]?.focus();
+        return true;
+      case 'Home': e.preventDefault(); items[0]?.focus(); return true;
+      case 'End': e.preventDefault(); items[items.length - 1]?.focus(); return true;
+      case 'Escape':
+        e.preventDefault();
+        closeTrackMenus(true);
+        return true;
+      case 'Tab':
+        closeTrackMenus();
+        return false;
+      case 'Enter':
+      case ' ':
+        // Native button activation handles a focused item; without focus, pick nothing.
+        if (cur >= 0) return true;
+        e.preventDefault();
+        return true;
+      case 'ArrowLeft':
+      case 'ArrowRight':
+        // Do not seek behind an open menu.
+        e.preventDefault();
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  // ============================================================
   // Controls
   // ============================================================
 
@@ -924,6 +1178,7 @@
         if (e.key === 'Escape') e.target.blur();
         return;
       }
+      if (handleTrackMenuKey(e)) return;
       switch(e.key) {
         case ' ':
         case 'k':
@@ -944,8 +1199,14 @@
           break;
         case 'm': video.muted = !video.muted; updateMuteIcon(); break;
         case 't': document.getElementById('menu-transcode')?.click(); break;
-        case 'c': ccBtn.click(); break;
+        case 'c': if (!ccBtn.disabled) ccBtn.click(); break;
+        case 'l': if (!audioBtn.classList.contains('hidden')) audioBtn.click(); break;
         case 'i': document.getElementById('info-btn')?.click(); break;
+        case 'd': {
+          const dlBtn = document.getElementById('download-btn');
+          if (dlBtn && !dlBtn.hidden) dlBtn.click();
+          break;
+        }
         case 'a': document.getElementById('cast-btn')?.click(); break;
         case 'x': document.getElementById('menu-restart')?.click(); break;
         case 'j':
@@ -964,7 +1225,7 @@
             container.classList.add('controls-visible');
             clearTimeout(activityTimeoutId);
             activityTimeoutId = setTimeout(() => {
-              if (!settingsMenu.classList.contains('open')) {
+              if (!anyMenuOpen()) {
                 container.classList.remove('controls-visible');
                 activityTimeoutId = null;
               }
@@ -1020,7 +1281,7 @@
     }
 
     function hideControls() {
-      if (settingsMenu.classList.contains('open')) return;
+      if (anyMenuOpen()) return;
       if (document.getElementById('seek-container')?.classList.contains('hidden') === false) return;
       container.classList.remove('controls-visible');
       activityTimeoutId = null;
@@ -1054,7 +1315,7 @@
       container.classList.add('controls-visible');
       clearTimeout(activityTimeoutId);
       activityTimeoutId = setTimeout(() => {
-        if (!settingsMenu.classList.contains('open') && seekContainer.classList.contains('hidden')) {
+        if (!anyMenuOpen() && seekContainer.classList.contains('hidden')) {
           container.classList.remove('controls-visible');
           activityTimeoutId = null;
         }
@@ -1116,27 +1377,9 @@
       }
     });
 
-    // CC button
-    ccBtn.addEventListener('click', function(e) {
-      e.stopPropagation();
-      ccEnabled = !ccEnabled;
-      if (activeTrackStates && activeTrackStates.length > 0) {
-        const prefIdx = getPreferredSubtitleTrack(activeTrackStates.map(ts => ({lang: ts.track.language, label: ts.track.label})));
-        activeTrackStates.forEach((ts, i) => ts.track.mode = (ccEnabled && i === prefIdx) ? 'showing' : 'hidden');
-      } else {
-        const tracks = Array.from(video.textTracks).filter(t => (t.kind === 'subtitles' || t.kind === 'captions') && t.mode !== 'disabled');
-        const prefIdx = getPreferredSubtitleTrack(tracks.map(t => ({lang: t.language, label: t.label})));
-        tracks.forEach((t, i) => t.mode = (ccEnabled && i === prefIdx) ? 'showing' : 'hidden');
-      }
-      if (currentHls) {
-        currentHls.subtitleDisplay = ccEnabled;
-        if (ccEnabled && currentHls.subtitleTracks?.length > 0) {
-          currentHls.subtitleTrack = getPreferredSubtitleTrack(currentHls.subtitleTracks);
-        }
-      }
-      updateCcButton();
-      saveSettings({ ccEnabled });
-    });
+    // CC and audio buttons open their dropdown menus
+    ccBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleTrackMenu('cc'); });
+    audioBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleTrackMenu('audio'); });
 
     // PiP button
     const pipBtn = document.getElementById('pip-btn');
@@ -1159,6 +1402,7 @@
 
     // Settings menu toggle
     document.getElementById('settings-btn')?.addEventListener('click', () => {
+      closeTrackMenus();
       settingsMenu.classList.toggle('open');
     });
 
@@ -1167,59 +1411,7 @@
       if (!e.target.closest('#settings-btn') && !e.target.closest('#settings-menu')) {
         settingsMenu.classList.remove('open');
       }
-    });
-
-    // CC Track selection
-    let selectedCcTrackIdx = 0;
-    const ccTracksMenuItem = document.getElementById('menu-cc-tracks');
-
-    function getCcTracks() {
-      const tracks = [];
-      if (activeTrackStates?.length > 0) {
-        activeTrackStates.forEach((ts, i) => tracks.push({ idx: i, label: ts.track.label || `Track ${i + 1}`, lang: ts.track.language }));
-      } else if (currentHls?.subtitleTracks?.length > 0) {
-        currentHls.subtitleTracks.forEach((t, i) => tracks.push({ idx: i, label: t.name || `Track ${i + 1}`, lang: t.lang }));
-      } else {
-        Array.from(video.textTracks).filter(t => t.kind === 'subtitles' || t.kind === 'captions')
-          .forEach((t, i) => tracks.push({ idx: i, label: t.label || `Track ${i + 1}`, lang: t.language }));
-      }
-      return tracks;
-    }
-
-    function selectCcTrack(idx) {
-      ccEnabled = true;
-      updateCcButton();
-      if (activeTrackStates?.length > 0) {
-        activeTrackStates.forEach((ts, i) => ts.track.mode = i === idx ? 'showing' : 'hidden');
-      } else if (currentHls?.subtitleTracks?.length > 0) {
-        currentHls.subtitleTrack = idx;
-        currentHls.subtitleDisplay = true;
-        // iOS: also set TextTrack.mode directly (HLS.js property change doesn't always trigger render)
-        const tracks = Array.from(video.textTracks).filter(
-          t => t.kind === 'subtitles' || t.kind === 'captions'
-        );
-        tracks.forEach((t, i) => t.mode = i === idx ? 'showing' : 'hidden');
-      } else {
-        const tracks = Array.from(video.textTracks).filter(t => t.kind === 'subtitles' || t.kind === 'captions');
-        tracks.forEach((t, i) => t.mode = i === idx ? 'showing' : 'hidden');
-      }
-    }
-
-    function updateCcTracksLabel() {
-      if (!ccTracksMenuItem) return;
-      const tracks = getCcTracks();
-      const label = tracks.length > 0 && tracks[selectedCcTrackIdx]
-        ? `CC: ${tracks[selectedCcTrackIdx].label}`
-        : 'CC Track';
-      ccTracksMenuItem.innerHTML = `<span class="settings-check"></span>${label}`;
-    }
-
-    ccTracksMenuItem?.addEventListener('click', () => {
-      const tracks = getCcTracks();
-      if (tracks.length === 0) return;
-      selectedCcTrackIdx = (selectedCcTrackIdx + 1) % tracks.length;
-      selectCcTrack(selectedCcTrackIdx);
-      updateCcTracksLabel();
+      if (!e.target.closest('.track-menu')) closeTrackMenus();
     });
 
     // Settings menu items
@@ -1316,13 +1508,6 @@
     video.addEventListener('keydown', (e) => {
       if (e.key === ' ') e.preventDefault();
     });
-
-    // Mousewheel volume control
-    document.getElementById('player-container')?.addEventListener('wheel', (e) => {
-      e.preventDefault();
-      video.volume = Math.max(0, Math.min(1, video.volume + (e.deltaY < 0 ? 0.05 : -0.05)));
-      saveSettings({ volume: video.volume });
-    }, { passive: false });
 
     // Progress bar
     const progressBar = document.getElementById('progress-bar');
@@ -1502,7 +1687,25 @@
   // Initialization
   // ============================================================
 
+  // Download button (VOD/series only; hidden until /api/downloads answers)
+  function setupDownloadButton() {
+    const btn = document.getElementById('download-btn');
+    if (!btn || !cfg.isVod || !window.NetvDL) return;
+    const isEpisode = cfg.streamType === 'series';
+    const id = isEpisode ? cfg.episodeId : cfg.streamId;
+    if (!id) return;
+    const media = cfg.mediaTitle || '';
+    const title = cfg.seriesName && !media.includes(cfg.seriesName) ? cfg.seriesName + ' ' + media : media;
+    window.NetvDL.bind(btn, isEpisode ? 'episode' : 'movie', id, {
+      title: (isEpisode ? title : media) || '',
+      sourceId: cfg.sourceId || '',
+      seriesId: isEpisode ? cfg.seriesId : '',
+      ext: ((String(cfg.rawUrl || '').split('?')[0].match(/\.([A-Za-z0-9]{2,5})$/) || [])[1] || '').toLowerCase(),
+    });
+  }
+
   function init() {
+    setupDownloadButton();
     // Restore persistent settings
     const settings = loadSettings();
     if (settings.volume !== undefined) video.volume = settings.volume;

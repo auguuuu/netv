@@ -42,6 +42,7 @@
            tabindex="0" autofocus>
           ▶ Play
         </a>
+        <div data-dl-kind="movie" data-dl-id="{{ movie.stream_id }}" data-dl-ext="{{ movie.container_extension or 'mkv' }}" data-dl-title="{{ movie.name }}" data-dl-variant="inline" class="inline-flex"></div>
         {% if movie.youtube_trailer %}
         <a href="https://www.youtube.com/watch?v={{ movie.youtube_trailer }}" target="_blank"
            class="inline-block px-4 sm:px-8 py-2 sm:py-4 bg-red-600 hover:bg-red-700 rounded-lg text-base sm:text-xl font-semibold focusable"

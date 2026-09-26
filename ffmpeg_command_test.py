@@ -10,12 +10,16 @@ import pytest
 
 from ffmpeg_command import (
     _MAX_RES_HEIGHT,
+    AudioStream,
     HwAccel,
     MediaInfo,
     SubtitleStream,
     _build_audio_args,
     _build_video_args,
     _get_gpu_nvdec_codecs,
+    audio_stream_from_dict,
+    audio_stream_to_dict,
+    build_audio_master_playlist,
     build_hls_ffmpeg_cmd,
     can_remux_live,
     clear_all_probe_cache,
@@ -29,6 +33,7 @@ from ffmpeg_command import (
     limit_live_video_bitrate,
     probe_media,
     restore_probe_cache_entry,
+    selectable_audio_streams,
 )
 
 
@@ -1264,3 +1269,152 @@ def test_bandwidth_saver_bypasses_ai_and_scales_down(hw: HwAccel):
     assert "720" in " ".join(cmd)
     assert "dnn_processing" not in " ".join(cmd)
     assert cmd[cmd.index("-c:v") + 1] != "copy"
+
+
+# =============================================================================
+# Multi-audio
+# =============================================================================
+
+
+def _two_audio_info(**kw) -> MediaInfo:
+    return MediaInfo(
+        video_codec="h264",
+        audio_codec="mp3",
+        pix_fmt="yuv420p",
+        audio_channels=2,
+        audio_sample_rate=44100,
+        height=720,
+        audio_streams=[
+            AudioStream(1, "jpn", "Japonais", "mp3", 2, 44100),
+            AudioStream(3, "fre", "Francais", "aac", 2, 48000, "LC"),
+        ],
+        **kw,
+    )
+
+
+class TestMultiAudio:
+    def test_single_audio_command_unchanged(self):
+        info = _two_audio_info()
+        legacy = build_hls_ffmpeg_cmd("http://t", "software", "/o", True, None, info)
+        assert legacy.count("-map") == 2
+        assert "0:a:0" in legacy
+        assert "-an" not in legacy
+        assert legacy[-1] == "/o/stream.m3u8"
+
+    def test_selectable_needs_vod_and_two_tracks(self):
+        info = _two_audio_info()
+        assert len(selectable_audio_streams(info)) == 2
+        assert selectable_audio_streams(info, is_vod=False) == []
+        assert selectable_audio_streams(None) == []
+        info.audio_streams = info.audio_streams[:1]
+        assert selectable_audio_streams(info) == []
+
+    def test_live_never_multi_audio(self):
+        info = _two_audio_info()
+        cmd = build_hls_ffmpeg_cmd("http://t", "software", "/o", False, None, info, multi_audio=True)
+        assert "-an" not in cmd
+        assert "0:a:0" in cmd
+        assert not any("a0.m3u8" in a for a in cmd)
+
+    def test_multi_audio_outputs(self):
+        info = _two_audio_info()
+        cmd = build_hls_ffmpeg_cmd("http://t", "software", "/o", True, None, info, multi_audio=True)
+        # main output stays first and video-only
+        main = cmd.index("/o/stream.m3u8")
+        assert "-an" in cmd[:main]
+        assert "0:a:0" not in cmd
+        assert cmd.index("-hls_flags") < main
+        # one audio-only output per track, by absolute stream index, after the main one
+        assert cmd.index("0:1") > main and cmd.index("0:3") > cmd.index("/o/a0.m3u8")
+        assert cmd[-1] == "/o/a1.m3u8"
+        assert cmd.count("-vn") == 2
+        # mp3 44.1k re-encoded to AAC, the aac LC 48k track is copied
+        a0 = cmd[cmd.index("0:1") : cmd.index("/o/a0.m3u8")]
+        a1 = cmd[cmd.index("0:3") : cmd.index("/o/a1.m3u8")]
+        assert "aac" in a0 and "-b:a" in a0
+        assert a1[a1.index("-c:a") + 1] == "copy"
+        assert "/o/a1_%03d.ts" in a1
+
+    def test_master_playlist(self):
+        info = _two_audio_info()
+        text = build_audio_master_playlist(info.audio_streams)
+        lines = text.splitlines()
+        assert lines[0] == "#EXTM3U"
+        media = [ln for ln in lines if ln.startswith("#EXT-X-MEDIA:")]
+        assert len(media) == 2
+        assert 'LANGUAGE="jpn"' in media[0] and 'NAME="Japonais"' in media[0]
+        assert "DEFAULT=YES" in media[0] and "DEFAULT=NO" in media[1]
+        assert 'LANGUAGE="fre"' in media[1] and 'URI="a1.m3u8"' in media[1]
+        assert lines[-2].startswith("#EXT-X-STREAM-INF") and 'AUDIO="audio"' in lines[-2]
+        assert lines[-1] == "stream_video.m3u8"
+
+    def test_master_playlist_undetermined_language(self):
+        text = build_audio_master_playlist([AudioStream(1, "und", "", "aac"), AudioStream(2)])
+        assert "LANGUAGE" not in text
+        assert 'NAME="Unknown"' in text
+
+    def test_probe_records_all_audio_streams(self):
+        import ffmpeg_command
+
+        ffmpeg_command._probe_cache.clear()
+        out = {
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "pix_fmt": "yuv420p",
+                 "height": 720},
+                {"index": 1, "codec_type": "audio", "codec_name": "mp3", "channels": 2,
+                 "sample_rate": "44100", "tags": {"language": "JPN", "title": "Japonais"}},
+                {"index": 3, "codec_type": "audio", "codec_name": "aac", "channels": 6,
+                 "sample_rate": "48000", "profile": "LC", "tags": {"language": "fre"}},
+            ],
+            "format": {"duration": "10"},
+        }
+        res = MagicMock(returncode=0, stdout=json.dumps(out))
+        with (
+            patch("subprocess.run", return_value=res),
+            patch("ffmpeg_command._load_settings", return_value={}),
+        ):
+            info, _ = probe_media("http://test/multi.mkv")
+        assert info is not None
+        assert info.audio_codec == "mp3" and info.audio_sample_rate == 44100
+        assert [(a.index, a.lang, a.name, a.codec, a.channels) for a in info.audio_streams] == [
+            (1, "jpn", "Japonais", "mp3", 2),
+            (3, "fre", "French", "aac", 6),
+        ]
+
+    def test_audio_streams_dict_roundtrip(self):
+        a = AudioStream(3, "fre", "Francais", "aac", 2, 48000, "LC")
+        assert audio_stream_from_dict(audio_stream_to_dict(a)) == a
+        assert audio_stream_from_dict({"index": 2}).lang == "und"
+
+    def test_series_cache_roundtrip_and_legacy_entries(self, tmp_path):
+        import ffmpeg_command
+
+        cache_file = tmp_path / "series.json"
+        info = _two_audio_info()
+        with (
+            patch.object(ffmpeg_command, "_SERIES_PROBE_CACHE_FILE", cache_file),
+            patch.dict(
+                ffmpeg_command._series_probe_cache,
+                {7: {"name": "S", "mru": 1, "episodes": {1: (time_now(), info, [])}}},
+                clear=True,
+            ),
+        ):
+            ffmpeg_command._save_series_probe_cache()
+            data = json.loads(cache_file.read_text())
+            assert data["7"]["episodes"]["1"]["audio_streams"][1]["lang"] == "fre"
+            # legacy entry (no audio_streams key) is dropped so it is re-probed
+            legacy = dict(data["7"]["episodes"]["1"])
+            del legacy["audio_streams"]
+            data["7"]["episodes"]["2"] = legacy
+            cache_file.write_text(json.dumps(data))
+            ffmpeg_command._series_probe_cache.clear()
+            ffmpeg_command._load_series_probe_cache()
+            eps = ffmpeg_command._series_probe_cache[7]["episodes"]
+            assert 2 not in eps
+            assert [a.lang for a in eps[1][1].audio_streams] == ["jpn", "fre"]
+
+
+def time_now() -> float:
+    import time
+
+    return time.time()

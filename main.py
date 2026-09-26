@@ -94,6 +94,7 @@ from playback_policy import PlaybackHealth
 from xtream import XtreamClient
 
 import auth
+import downloads
 import epg
 import ffmpeg_command
 import ffmpeg_session
@@ -224,6 +225,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Clean up orphaned dirs and recover valid VOD sessions
     ffmpeg_session.cleanup_and_recover_sessions()
 
+    # Offline downloads: load the index (running ones come back paused) and start the queue
+    try:
+        downloads.startup()
+    except Exception:
+        log.exception("Downloads could not start")
+
     # Preload all data in background threads (parallel)
     def load_live():
         get_refresh_in_progress().add("guide_load")
@@ -235,6 +242,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 get_cache()["live_streams"] = streams
                 get_cache()["epg_urls"] = epg_urls
             log.info("Live data loaded")
+        except Exception as e:
+            log.warning("Live preload failed (offline?): %s", e)
         finally:
             get_refresh_in_progress().discard("guide_load")
 
@@ -252,18 +261,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             log.error("EPG load error: %s", e)
 
     def load_vod():
-        vod_cats, vod_streams = load_vod_data()
-        with get_cache_lock():
-            get_cache()["vod_categories"] = vod_cats
-            get_cache()["vod_streams"] = vod_streams
-        log.info("VOD data loaded")
+        try:
+            vod_cats, vod_streams = load_vod_data()
+            with get_cache_lock():
+                get_cache()["vod_categories"] = vod_cats
+                get_cache()["vod_streams"] = vod_streams
+            log.info("VOD data loaded")
+        except Exception as e:
+            log.warning("VOD preload failed (offline?): %s", e)
 
     def load_series():
-        series_cats, series_list = load_series_data()
-        with get_cache_lock():
-            get_cache()["series_categories"] = series_cats
-            get_cache()["series"] = series_list
-        log.info("Series data loaded")
+        try:
+            series_cats, series_list = load_series_data()
+            with get_cache_lock():
+                get_cache()["series_categories"] = series_cats
+                get_cache()["series"] = series_list
+            log.info("Series data loaded")
+        except Exception as e:
+            log.warning("Series preload failed (offline?): %s", e)
 
     # Start all preloads in parallel (EPG waits for live data internally)
     def load_all():
@@ -338,6 +353,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cleanup_stop.set()
     scheduler_stop.set()
     ffmpeg_session.shutdown()
+    downloads.shutdown()
 
 
 app = FastAPI(title="neTV", lifespan=lifespan)
@@ -389,6 +405,10 @@ def require_admin(request: Request) -> dict:
     if not auth.is_admin(username):
         raise HTTPException(403, "Admin access required")
     return user
+
+
+# Offline downloads: /api/downloads*, /downloads/files/{id}, /api/online (logic in downloads.py)
+app.include_router(downloads.build_router(require_auth))
 
 
 # =============================================================================
@@ -1548,6 +1568,54 @@ def _ensure_live_cache() -> None:
             load_all_epg(get_cache().get("epg_urls", []))
 
 
+@app.get("/play/download/{download_id}", response_class=HTMLResponse)
+async def player_download_page(
+    request: Request,
+    download_id: str,
+    user: Annotated[dict, Depends(require_auth)],
+):
+    """Play a finished download through the regular player (works with no internet).
+
+    The local file path is the player's source URL; /transcode/start accepts it
+    only when it points inside the download folder. Must be declared before the
+    generic /play/{stream_type}/{stream_id:path} route.
+    """
+    entry, path = downloads.get_manager().file_for(download_id)
+    username = user.get("sub", "")
+    user_settings = load_user_settings(username)
+    raw_url = str(path)
+    is_episode = entry.kind == "episode"
+    watch_entry = get_watch_position(username, raw_url)
+    return TEMPLATES.TemplateResponse(
+        request,
+        "player.html",
+        {
+            "raw_url": raw_url,
+            "stream_id": entry.item_id,
+            "transcode_mode": "always",
+            "live_dvr_mins": 0,
+            "stream_type": "series" if is_episode else "movie",
+            "channel_name": entry.title,
+            "program_title": "",
+            "program_desc": "",
+            "program_start": 0.0,
+            "program_end": 0.0,
+            "captions_enabled": user_settings.get("captions_enabled", False),
+            "resume_position": watch_entry.get("position", 0.0) if watch_entry else 0.0,
+            "series_id": entry.series_id if is_episode else None,
+            "episode_id": int(entry.item_id) if is_episode and entry.item_id.isdigit() else None,
+            "series_name": "",
+            "cc_lang": user_settings.get("cc_lang", ""),
+            "cc_style": user_settings.get("cc_style", {}),
+            "cast_host": user_settings.get("cast_host", ""),
+            "next_episode_url": None,
+            "deinterlace_fallback": False,
+            "source_id": "",
+            "content_access": _get_content_access(username),
+        },
+    )
+
+
 @app.get("/play/{stream_type}/{stream_id:path}", response_class=HTMLResponse)
 async def player_page(
     request: Request,
@@ -1878,6 +1946,11 @@ async def transcode_start(
     fast_start: bool = False,
 ):
     """Start a transcode session, return session ID."""
+    # Local inputs are only allowed for finished downloads (never arbitrary files)
+    if (url.startswith(("/", "file:", ".", "~")) or "://" not in url) and not (
+        downloads.get_manager().is_inside(url)
+    ):
+        raise HTTPException(400, "Local input must be inside the download folder")
     deinterlace_fb = deinterlace_fallback == "1"
     username = user.get("sub", "")
 
@@ -1963,6 +2036,25 @@ async def transcode_file(
     if not session:
         log.debug(f"[CAST] 404 session not found: {session_id}")
         raise HTTPException(404, "Transcode session not found")
+
+    # Multi-audio VOD: stream.m3u8 is served as an HLS master with one EXT-X-MEDIA
+    # per audio track; the real (video-only) media playlist is exposed as stream_video.m3u8.
+    audio_tracks = session.get("audio_tracks") or []
+    if audio_tracks and safe_filename == "stream.m3u8":
+        if not (pathlib.Path(session["dir"]) / "stream.m3u8").exists():
+            raise HTTPException(404, "File not found")
+        return Response(
+            content=ffmpeg_command.build_audio_master_playlist(
+                [ffmpeg_command.audio_stream_from_dict(t) for t in audio_tracks]
+            ),
+            media_type="application/vnd.apple.mpegurl",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Access-Control-Allow-Origin": "*",
+            },
+        )
+    if audio_tracks and safe_filename == "stream_video.m3u8":
+        safe_filename = filename = "stream.m3u8"
 
     file_path = pathlib.Path(session["dir"]) / safe_filename
     if not file_path.exists():
@@ -2154,6 +2246,12 @@ def _get_content_access_from_request(request: Request) -> dict[str, bool]:
 
 
 TEMPLATES.env.globals["get_content_access_from_request"] = _get_content_access_from_request
+
+
+@app.get("/downloads", response_class=HTMLResponse)
+async def downloads_page(request: Request, user: Annotated[dict, Depends(require_auth)]):
+    """Offline downloads page (client-side driven by /api/downloads)."""
+    return TEMPLATES.TemplateResponse(request, "downloads.html", {})
 
 
 @app.get("/settings", response_class=HTMLResponse)

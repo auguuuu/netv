@@ -917,3 +917,108 @@ class TestPlaybackFeedback:
             with pytest.raises(HTTPException) as error:
                 report_playback_health(session_id, username, health)
             assert error.value.status_code == status
+
+
+class TestMultiAudioSession:
+    def _media(self):
+        from ffmpeg_command import AudioStream, MediaInfo
+
+        return MediaInfo(
+            video_codec="h264",
+            audio_codec="mp3",
+            pix_fmt="yuv420p",
+            height=720,
+            audio_streams=[
+                AudioStream(1, "jpn", "Japonais", "mp3", 2, 44100),
+                AudioStream(3, "fre", "Francais", "mp3", 2, 44100),
+            ],
+        )
+
+    def test_audio_tracks_response(self):
+        from ffmpeg_session import _build_audio_tracks_response
+
+        assert _build_audio_tracks_response(None) == []
+        out = _build_audio_tracks_response(
+            [{"lang": "jpn", "name": "Japonais"}, {"lang": "fre", "name": ""}]
+        )
+        assert out[0] == {"index": 0, "lang": "jpn", "label": "Japonais", "default": True}
+        assert out[1]["label"] == "fre" and out[1]["default"] is False
+
+    def test_recovered_session_keeps_audio_tracks(self, tmp_path):
+        d = tmp_path / "netv_transcode_x"
+        d.mkdir()
+        (d / "seg000.ts").write_bytes(b"0")
+        tracks = [{"index": 1, "lang": "jpn", "name": "J"}, {"index": 3, "lang": "fre", "name": "F"}]
+        (d / "session.json").write_text(
+            json.dumps(
+                {"session_id": "sx", "url": "http://u/x", "is_vod": True, "audio_tracks": tracks}
+            )
+        )
+        with (
+            patch("ffmpeg_session.get_transcode_dir", return_value=tmp_path),
+            patch.dict(_transcode_sessions, {}, clear=True),
+            patch.dict(_url_to_session, {}, clear=True),
+        ):
+            cleanup_and_recover_sessions()
+            assert _transcode_sessions["sx"]["audio_tracks"] == tracks
+
+    @pytest.mark.asyncio
+    async def test_seek_restarts_all_outputs_with_offset(self, tmp_path):
+        import ffmpeg_session
+
+        (tmp_path / "seg000.ts").write_bytes(b"x" * 10)
+        (tmp_path / "a0.m3u8").write_text("old")
+        (tmp_path / "a0_000.ts").write_bytes(b"old")
+        tracks = [{"index": 1, "lang": "jpn", "name": "J"}, {"index": 3, "lang": "fre", "name": "F"}]
+        session = {
+            "url": "http://u/x",
+            "dir": str(tmp_path),
+            "process": FakeProcess(alive=False),
+            "is_vod": True,
+            "audio_tracks": tracks,
+        }
+        launched: list[list[str]] = []
+
+        async def fake_launch(cmd):
+            launched.append(cmd)
+            return FakeProcess()
+
+        with (
+            patch.dict(_transcode_sessions, {"s": session}, clear=True),
+            patch.dict(_url_to_session, {}, clear=True),
+            patch("ffmpeg_session.get_settings", return_value={"probe_movies": True}),
+            patch("ffmpeg_session.resolve_hls_master_playlist", side_effect=lambda u: u),
+            patch("ffmpeg_session.probe_media", return_value=(self._media(), [])),
+            patch("ffmpeg_session._launch_ffmpeg", new=fake_launch),
+            patch("ffmpeg_session._wait_for_playlist", new=AsyncMock(return_value=True)),
+            patch("ffmpeg_session._spawn_background_task", side_effect=lambda c: c.close()),
+        ):
+            await ffmpeg_session.seek_transcode("s", 300.0)
+
+        cmd = launched[0]
+        assert cmd.count("-output_ts_offset") == 3  # video + 2 audio renditions
+        assert cmd[cmd.index("-output_ts_offset") + 1] == "-300.0"
+        assert cmd.count("-vn") == 2 and "-an" in cmd
+        assert not (tmp_path / "a0.m3u8").exists()
+        assert not (tmp_path / "a0_000.ts").exists()
+        assert (tmp_path / "seg000.ts").exists()
+
+    @pytest.mark.asyncio
+    async def test_dead_multi_audio_session_is_not_resumed(self, tmp_path):
+        from ffmpeg_session import _handle_existing_vod_session
+
+        (tmp_path / "seg000.ts").write_bytes(b"x" * 10)
+        session = {
+            "url": "http://u/x",
+            "dir": str(tmp_path),
+            "process": FakeProcess(alive=False),
+            "is_vod": True,
+            "audio_tracks": [{"lang": "jpn"}, {"lang": "fre"}],
+        }
+        with (
+            patch.dict(_transcode_sessions, {"s": session}, clear=True),
+            patch.dict(_url_to_session, {"http://u/x": "s"}, clear=True),
+            patch("ffmpeg_session.stop_session") as stop,
+        ):
+            assert await _handle_existing_vod_session("s", "http://u/x", "software", False) is None
+            stop.assert_called_once()

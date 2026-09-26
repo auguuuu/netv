@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 import json
@@ -123,6 +123,43 @@ class SubtitleStream:
 
 
 @dataclass(slots=True)
+class AudioStream:
+    """One audio track of the source (index is the absolute ffprobe stream index)."""
+
+    index: int
+    lang: str = "und"
+    name: str = ""
+    codec: str = ""
+    channels: int = 0
+    sample_rate: int = 0
+    profile: str = ""
+
+
+def audio_stream_to_dict(a: AudioStream) -> dict[str, Any]:
+    return {
+        "index": a.index,
+        "lang": a.lang,
+        "name": a.name,
+        "codec": a.codec,
+        "channels": a.channels,
+        "sample_rate": a.sample_rate,
+        "profile": a.profile,
+    }
+
+
+def audio_stream_from_dict(d: dict[str, Any]) -> AudioStream:
+    return AudioStream(
+        index=int(d.get("index", 0)),
+        lang=str(d.get("lang", "und")),
+        name=str(d.get("name", "")),
+        codec=str(d.get("codec", "")),
+        channels=int(d.get("channels", 0) or 0),
+        sample_rate=int(d.get("sample_rate", 0) or 0),
+        profile=str(d.get("profile", "")),
+    )
+
+
+@dataclass(slots=True)
 class MediaInfo:
     video_codec: str
     audio_codec: str
@@ -138,6 +175,8 @@ class MediaInfo:
     is_10bit: bool = False  # True if pix_fmt indicates 10-bit color
     is_hdr: bool = False  # True if color transfer indicates HDR
     is_hls: bool = False  # True if format is HLS (for input options)
+    # Every audio track in source order (empty when unknown, e.g. old cache entries)
+    audio_streams: list[AudioStream] = field(default_factory=list)
 
 
 def init(
@@ -394,6 +433,8 @@ def _load_series_probe_cache() -> None:
                     video_codec = entry.get("video_codec", "")
                     if not video_codec:
                         continue  # Skip entries without video codec
+                    if "audio_streams" not in entry:
+                        continue  # Pre multi-audio entry: drop so it is re-probed
                     media_info = MediaInfo(
                         video_codec=video_codec,
                         audio_codec=entry.get("audio_codec", ""),
@@ -408,6 +449,9 @@ def _load_series_probe_cache() -> None:
                         is_10bit=entry.get("is_10bit", False),
                         is_hdr=entry.get("is_hdr", False),
                         is_hls=entry.get("is_hls", False),
+                        audio_streams=[
+                            audio_stream_from_dict(a) for a in entry.get("audio_streams") or []
+                        ],
                     )
                     subs = [
                         SubtitleStream(s["index"], s.get("lang", "und"), s.get("name", ""))
@@ -452,6 +496,7 @@ def _save_series_probe_cache() -> None:
                     "interlaced": media_info.interlaced,
                     "is_10bit": media_info.is_10bit,
                     "is_hdr": media_info.is_hdr,
+                    "audio_streams": [audio_stream_to_dict(a) for a in media_info.audio_streams],
                     "subtitles": [{"index": s.index, "lang": s.lang, "name": s.name} for s in subs],
                 }
     try:
@@ -770,6 +815,7 @@ def probe_media(
     audio_channels = audio_sample_rate = 0
     subtitle_codecs: list[str] = []
     subtitles: list[SubtitleStream] = []
+    audio_streams: list[AudioStream] = []
 
     height = 0
     video_bitrate = 0
@@ -795,11 +841,28 @@ def probe_media(
             # Try to get bitrate from stream, fall back to format
             with suppress(ValueError, TypeError):
                 video_bitrate = int(stream.get("bit_rate", 0) or 0)
-        elif codec_type == "audio" and not audio_codec:
-            audio_codec = codec
-            audio_channels = stream.get("channels", 0)
-            audio_sample_rate = int(stream.get("sample_rate", 0) or 0)
-            audio_profile = stream.get("profile", "")
+        elif codec_type == "audio":
+            a_tags = stream.get("tags", {}) or {}
+            a_lang = str(a_tags.get("language", "und")).lower()
+            a_sr = 0
+            with suppress(ValueError, TypeError):
+                a_sr = int(stream.get("sample_rate", 0) or 0)
+            audio_streams.append(
+                AudioStream(
+                    index=stream.get("index", 0),
+                    lang=a_lang,
+                    name=a_tags.get("title") or a_tags.get("name") or _lang_display_name(a_lang),
+                    codec=codec,
+                    channels=stream.get("channels", 0) or 0,
+                    sample_rate=a_sr,
+                    profile=stream.get("profile", "") or "",
+                )
+            )
+            if not audio_codec:
+                audio_codec = codec
+                audio_channels = stream.get("channels", 0)
+                audio_sample_rate = a_sr
+                audio_profile = stream.get("profile", "")
         elif codec_type == "subtitle":
             subtitle_codecs.append(codec)
             if codec in TEXT_SUBTITLE_CODECS:
@@ -844,6 +907,7 @@ def probe_media(
         is_10bit=is_10bit,
         is_hdr=is_hdr,
         is_hls=is_hls,
+        audio_streams=audio_streams,
     )
     # Only cache if we got valid video info (height > 0)
     if height <= 0:
@@ -1246,6 +1310,71 @@ def _can_copy_audio(media_info: MediaInfo | None) -> bool:
     )
 
 
+def _can_copy_audio_stream(a: AudioStream) -> bool:
+    """Same rule as _can_copy_audio, for one specific audio track."""
+    return bool(
+        a.codec == "aac"
+        and a.channels <= 2
+        and a.sample_rate in (44100, 48000)
+        and "HE" not in a.profile
+    )
+
+
+def selectable_audio_streams(
+    media_info: MediaInfo | None, *, is_vod: bool = True
+) -> list[AudioStream]:
+    """Audio tracks to expose as HLS alternates, or [] to keep the single-audio path.
+
+    Only VOD sources with two or more probed audio tracks qualify. Live and
+    unprobed sources always return [] so their command is unchanged.
+    """
+    if not is_vod or not media_info or len(media_info.audio_streams) < 2:
+        return []
+    return list(media_info.audio_streams)
+
+
+def audio_playlist_name(i: int) -> str:
+    return f"a{i}.m3u8"
+
+
+def audio_segment_pattern(output_dir: str, i: int) -> str:
+    return f"{output_dir}/a{i}_%03d.ts"
+
+
+def build_audio_master_playlist(
+    audio_streams: list[AudioStream], video_playlist: str = "stream_video.m3u8"
+) -> str:
+    """HLS master playlist with one video variant and one EXT-X-MEDIA per audio track.
+
+    The first track is DEFAULT/AUTOSELECT. Renditions are audio-only playlists
+    (a0.m3u8, a1.m3u8, ...) written next to the video-only stream.m3u8.
+    """
+
+    def q(v: str) -> str:
+        return v.replace('"', "'").replace("\n", " ").strip()
+
+    lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
+    for i, a in enumerate(audio_streams):
+        lang = q(a.lang) if a.lang and a.lang != "und" else ""
+        name = q(a.name) or q(_lang_display_name(a.lang)) or f"Audio {i + 1}"
+        attrs = [
+            "TYPE=AUDIO",
+            'GROUP-ID="audio"',
+            f'NAME="{name}"',
+        ]
+        if lang:
+            attrs.append(f'LANGUAGE="{lang}"')
+        attrs.append(f"DEFAULT={'YES' if i == 0 else 'NO'}")
+        attrs.append("AUTOSELECT=YES")
+        if a.channels:
+            attrs.append(f'CHANNELS="{min(a.channels, 2)}"')
+        attrs.append(f'URI="{audio_playlist_name(i)}"')
+        lines.append("#EXT-X-MEDIA:" + ",".join(attrs))
+    lines.append('#EXT-X-STREAM-INF:BANDWIDTH=8000000,AUDIO="audio"')
+    lines.append(video_playlist)
+    return "\n".join(lines) + "\n"
+
+
 def can_remux_live(media_info: MediaInfo | None, max_resolution: str = "1080p") -> bool:
     """Can a live source be retained via a stream-copy HLS remux?"""
     return _can_copy_video(media_info, max_resolution) and _can_copy_audio(media_info)
@@ -1263,8 +1392,16 @@ def build_hls_ffmpeg_cmd(
     user_agent: str | None = None,
     deinterlace_fallback: bool | None = None,
     allow_upscale: bool = True,
+    multi_audio: bool = False,
 ) -> list[str]:
-    """Build ffmpeg command for HLS transcoding."""
+    """Build ffmpeg command for HLS transcoding.
+
+    With multi_audio=True (VOD only, needs >= 2 probed audio tracks) the main
+    stream.m3u8 output becomes video-only and one extra audio-only HLS output
+    (a<i>.m3u8) is appended per audio track. Otherwise the command is the
+    classic single 0:v:0 + 0:a:0 mux.
+    """
+    audio_tracks = selectable_audio_streams(media_info, is_vod=is_vod) if multi_audio else []
     # Check if we can copy streams directly (compatible codecs, no processing needed)
     copy_video = _can_copy_video(media_info, max_resolution, allow_upscale=allow_upscale)
     copy_audio = _can_copy_audio(media_info)
@@ -1340,7 +1477,8 @@ def build_hls_ffmpeg_cmd(
         ]
     )
     cmd.extend(http_reconnect_args(input_url))
-    if user_agent:
+    if user_agent and input_url.startswith(("http://", "https://")):
+        # -user_agent is an http protocol option: ffmpeg rejects it for local files
         cmd.extend(["-user_agent", user_agent])
     # Use HLS demuxer options if probe detected HLS format
     if media_info and media_info.is_hls:
@@ -1362,9 +1500,14 @@ def build_hls_ffmpeg_cmd(
         )
 
     # Stream mapping + video + audio
-    cmd.extend(["-map", "0:v:0", "-map", "0:a:0"])
-    cmd.extend(video_post)
-    cmd.extend(audio_args)
+    if audio_tracks:
+        cmd.extend(["-map", "0:v:0"])
+        cmd.extend(video_post)
+        cmd.append("-an")
+    else:
+        cmd.extend(["-map", "0:v:0", "-map", "0:a:0"])
+        cmd.extend(video_post)
+        cmd.extend(audio_args)
 
     # HLS output args
     cmd.extend(
@@ -1396,6 +1539,37 @@ def build_hls_ffmpeg_cmd(
         cmd.extend(["-hls_flags", "delete_segments"])
 
     cmd.append(f"{output_dir}/stream.m3u8")
+
+    # Alternate audio renditions: one audio-only HLS output per source track.
+    # Appended after the main output so option lookups on the main one still hit it.
+    for i, a in enumerate(audio_tracks):
+        cmd.extend(["-map", f"0:{a.index}", "-vn"])
+        cmd.extend(
+            _build_audio_args(
+                copy_audio=_can_copy_audio_stream(a), audio_sample_rate=a.sample_rate
+            )
+        )
+        cmd.extend(
+            [
+                "-max_delay",
+                "5000000",
+                "-f",
+                "hls",
+                "-hls_time",
+                str(int(segment_duration)),
+                "-hls_list_size",
+                "0",
+                "-hls_segment_filename",
+                audio_segment_pattern(output_dir, i),
+                "-hls_init_time",
+                "2",
+                "-hls_flags",
+                "independent_segments",
+                "-hls_playlist_type",
+                "event",
+                f"{output_dir}/{audio_playlist_name(i)}",
+            ]
+        )
     if sr_applied and not is_vod:
         limit_live_video_bitrate(cmd, max_resolution)
     return cmd

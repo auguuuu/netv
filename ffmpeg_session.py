@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import asyncio
@@ -34,6 +34,8 @@ from ffmpeg_command import (
     HwAccel,
     MediaInfo,
     SubtitleStream,
+    audio_stream_from_dict,
+    audio_stream_to_dict,
     build_hls_ffmpeg_cmd,
     can_remux_live,
     get_hls_segment_duration,
@@ -45,6 +47,7 @@ from ffmpeg_command import (
     probe_media,
     resolve_hls_master_playlist,
     restore_probe_cache_entry,
+    selectable_audio_streams,
 )
 from playback_policy import PlaybackHealth, PlaybackPolicy, UpgradePolicy
 from util import redact_url_credentials
@@ -367,6 +370,7 @@ def cleanup_and_recover_sessions() -> None:
                     "episode_id": info.get("episode_id"),
                     "username": info.get("username", ""),
                     "source_id": info.get("source_id", ""),
+                    "audio_tracks": info.get("audio_tracks") or [],
                 }
                 # Prefer session with seek_offset or more recent mtime
                 existing_id = _url_to_session.get(url)
@@ -557,6 +561,19 @@ def _build_subtitle_tracks(
     ]
 
 
+def _build_audio_tracks_response(audio_tracks: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Audio track summary for API responses (empty for single-audio sessions)."""
+    return [
+        {
+            "index": i,
+            "lang": a.get("lang", "und"),
+            "label": a.get("name") or a.get("lang", "und"),
+            "default": i == 0,
+        }
+        for i, a in enumerate(audio_tracks or [])
+    ]
+
+
 def _regenerate_playlist(output_dir: pathlib.Path, start_segment: int) -> None:
     """Regenerate HLS playlist starting from a specific segment (for smart seek)."""
     playlist_path = output_dir / "stream.m3u8"
@@ -606,6 +623,7 @@ class _SessionSnapshot:
     seek_offset: float
     subtitles: list[dict[str, Any]]
     duration: float
+    audio_tracks: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _get_session_snapshot(session_id: str) -> _SessionSnapshot | None:
@@ -621,6 +639,7 @@ def _get_session_snapshot(session_id: str) -> _SessionSnapshot | None:
             seek_offset=session.get("seek_offset", 0),
             subtitles=session.get("subtitles") or [],
             duration=session.get("duration", 0),
+            audio_tracks=session.get("audio_tracks") or [],
         )
 
 
@@ -655,6 +674,7 @@ def _build_session_response(
         "session_id": session_id,
         "playlist": f"/transcode/{session_id}/stream.m3u8",
         "subtitles": _build_subtitle_tracks(session_id, snap.subtitles),
+        "audio_tracks": _build_audio_tracks_response(snap.audio_tracks),
         "duration": snap.duration,
         "seek_offset": snap.seek_offset,
         "transcoded_duration": _calc_hls_duration(playlist_path, len(segments)),
@@ -738,6 +758,14 @@ async def _handle_existing_vod_session(
             snap.seek_offset,
         )
         return _build_session_response(existing_id, snap, playlist_path)
+
+    # Multi-audio sessions cannot be appended (audio renditions would desync): restart fresh
+    if snap.audio_tracks:
+        log.info("Session %s has alternate audio, restarting instead of resuming", existing_id)
+        stop_session(existing_id, force=True)
+        with _transcode_lock:
+            _url_to_session.pop(url, None)
+        return None
 
     # Case 4: Dead session, no seek_offset - append new content
     hls_duration = _calc_hls_duration(playlist_path, len(segments))
@@ -904,6 +932,15 @@ async def _do_start_transcode(
                 subs_str,
             )
 
+    # Multi-audio (VOD, 2+ probed tracks): expose every track as an HLS alternate.
+    audio_tracks = selectable_audio_streams(media_info, is_vod=is_vod)
+    audio_track_info = [audio_stream_to_dict(a) for a in audio_tracks]
+    if audio_tracks:
+        log.info(
+            "Multi-audio: %s",
+            ",".join(f"{a.lang}/{a.codec}/{a.channels}ch" for a in audio_tracks),
+        )
+
     cmd = build_hls_ffmpeg_cmd(
         url,
         hw,
@@ -916,6 +953,7 @@ async def _do_start_transcode(
         get_user_agent(),
         deinterlace_fallback,
         allow_upscale=not bandwidth_saver,
+        multi_audio=bool(audio_tracks),
     )
     if old_seek_offset > 0:
         i_idx = cmd.index("-i")
@@ -954,6 +992,7 @@ async def _do_start_transcode(
             "username": username,
             "source_id": source_id,
             "bandwidth_saver": bandwidth_saver,
+            "audio_tracks": audio_track_info,
             "playback_policy": PlaybackPolicy(bandwidth_saver=bandwidth_saver),
             "recovery_bitrate": live_video_bitrates(settings.get("max_resolution", "1080p"))[1]
             * 1.1,
@@ -973,6 +1012,7 @@ async def _do_start_transcode(
             "episode_id": episode_id,
             "username": username,
             "source_id": source_id,
+            "audio_tracks": audio_track_info,
         }
         if media_info:
             session_info["probe"] = {
@@ -1014,6 +1054,7 @@ async def _do_start_transcode(
         "session_id": session_id,
         "playlist": f"/transcode/{session_id}/stream.m3u8",
         "subtitles": _build_subtitle_tracks(session_id, sub_info),
+        "audio_tracks": _build_audio_tracks_response(audio_track_info),
         "duration": total_duration,
         "seek_offset": old_seek_offset,
     }
@@ -1201,6 +1242,7 @@ class _SeekSessionInfo:
     subtitles: list[dict[str, Any]]
     series_id: int | None
     episode_id: int | None
+    audio_tracks: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _get_seek_session_info(session_id: str) -> _SeekSessionInfo | None:
@@ -1216,6 +1258,7 @@ def _get_seek_session_info(session_id: str) -> _SeekSessionInfo | None:
             subtitles=session.get("subtitles") or [],
             series_id=session.get("series_id"),
             episode_id=session.get("episode_id"),
+            audio_tracks=session.get("audio_tracks") or [],
         )
 
 
@@ -1236,7 +1279,12 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
     target_segment = output_path / f"{SEG_PREFIX}{segment_num:03d}.ts"
 
     # Smart seek: if target segment exists, no need to restart ffmpeg
-    if target_segment.exists() and target_segment.stat().st_size > _MIN_SEGMENT_SIZE_BYTES:
+    # (not with alternate audio: audio renditions are not kept segment-aligned)
+    if (
+        not info.audio_tracks
+        and target_segment.exists()
+        and target_segment.stat().st_size > _MIN_SEGMENT_SIZE_BYTES
+    ):
         log.info(
             "Smart seek: segment %d exists for time %.1fs, skipping ffmpeg restart",
             segment_num,
@@ -1266,6 +1314,9 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
             pass
     for vtt_file in output_path.glob("sub*.vtt"):
         vtt_file.unlink(missing_ok=True)
+    # Alternate audio renditions restart from the seek point: drop them entirely
+    for audio_file in [*output_path.glob("a[0-9]*.m3u8"), *output_path.glob("a[0-9]*_*.ts")]:
+        audio_file.unlink(missing_ok=True)
 
     # Resolve HLS master playlist to highest bandwidth variant
     url = await asyncio.to_thread(resolve_hls_master_playlist, info.url)
@@ -1296,6 +1347,13 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
                 )
             )
 
+    # Keep the session's alternate audio layout (master playlist already advertises it)
+    multi_audio = bool(info.audio_tracks) and media_info is not None
+    if multi_audio and media_info is not None and not media_info.audio_streams:
+        media_info = replace(
+            media_info, audio_streams=[audio_stream_from_dict(a) for a in info.audio_tracks]
+        )
+
     cmd = build_hls_ffmpeg_cmd(
         url,
         hw,
@@ -1307,14 +1365,22 @@ async def seek_transcode(session_id: str, seek_time: float) -> dict[str, Any]:
         quality,
         get_user_agent(),
         None,
+        multi_audio=multi_audio,
     )
     i_idx = cmd.index("-i")
     cmd.insert(i_idx, str(seek_time))
     cmd.insert(i_idx, "-ss")
     # Shift output timestamps so subtitles start at 0 after seek
-    f_idx = cmd.index("-f")
-    cmd.insert(f_idx, str(-seek_time))
-    cmd.insert(f_idx, "-output_ts_offset")
+    # (every HLS output: video and each alternate audio rendition)
+    for f_idx in reversed(
+        [
+            n
+            for n in range(cmd.index("-i") + 1, len(cmd) - 1)
+            if cmd[n] == "-f" and cmd[n + 1] == "hls"
+        ]
+    ):
+        cmd.insert(f_idx, str(-seek_time))
+        cmd.insert(f_idx, "-output_ts_offset")
     cmd.extend(["-start_number", str(segment_num)])
 
     log.info(
