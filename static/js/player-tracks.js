@@ -106,6 +106,57 @@
     return /\boriginal\b|\borig\.|\bv\.?o\.?\b|\bo\.?v\.?\b/i.test(trackText(track));
   }
 
+  // Commentary / audio description tracks are never the original version.
+  function isCommentary(track) {
+    return /comment|description|descripti|\bad\b|audio desc/i.test(trackText(track));
+  }
+
+  function trackLangName(track) {
+    return languageName(track.lang) || languageName(track.name);
+  }
+
+  // Which audio track is the original version (VO), or null when unknown.
+  // tracks: [{lang, name, label?, original?}]
+  // opts.originalLang: ISO 639-1 code or ''; opts.source: 'tmdb' (certain),
+  // 'country' (probable), 'flag', or ''.
+  // Returns {idx, lang, probable, source} where lang is the French language
+  // name ('' when unknown) and source is 'tmdb' | 'country' | 'flag' | 'name'.
+  // Order: track matching the original language (a flagged one first), else a track
+  // flagged as original. Commentary tracks are skipped; the first match wins.
+  function findOriginal(tracks, opts) {
+    if (!tracks || tracks.length === 0) return null;
+    const o = opts || {};
+    const flagged = (t) => t.original === true || isOriginal(t);
+    const wanted = languageName(o.originalLang);
+    if (wanted) {
+      const matches = tracks
+        .map((t, i) => ({ t, i }))
+        .filter(({ t }) => trackLangName(t) === wanted && !isCommentary(t));
+      if (matches.length > 0) {
+        const pick = matches.find(({ t }) => flagged(t)) || matches[0];
+        const source = o.source === 'country' ? 'country' : 'tmdb';
+        return { idx: pick.i, lang: wanted, probable: source === 'country', source };
+      }
+    }
+    const i = tracks.findIndex(t => flagged(t) && !isCommentary(t));
+    if (i < 0) return null;
+    const source = tracks[i].original === true ? 'flag' : 'name';
+    return { idx: i, lang: trackLangName(tracks[i]), probable: false, source };
+  }
+
+  // Tooltip text for a VO result, e.g. "Version originale : Anglais".
+  function originalTitle(info) {
+    if (!info) return '';
+    const base = info.probable ? 'Version originale probable' : 'Version originale';
+    return info.lang ? `${base} : ${info.lang}` : base;
+  }
+
+  // Tooltip for the audio button, e.g. "Audio (l), VO : Anglais".
+  function audioButtonTitle(base, info) {
+    if (!info || !info.lang) return base;
+    return `${base}, VO${info.probable ? ' probable' : ''} : ${info.lang}`;
+  }
+
   // Default audio track index. Order: language the user picked last
   // (opts.preferred), original language (opts.original, or a track named
   // "original"), English, French, then the first track. -1 when there are no tracks.
@@ -142,7 +193,8 @@
 
   const api = {
     languageName, trackLabel, findAudioByLang, langKey,
-    isSdh, isForced, isOriginal, pickDefaultAudio, pickDefaultSubtitle,
+    isSdh, isForced, isOriginal, isCommentary, findOriginal, originalTitle, audioButtonTitle,
+    pickDefaultAudio, pickDefaultSubtitle,
   };
   root.NetvTracks = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;

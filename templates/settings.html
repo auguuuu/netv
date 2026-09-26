@@ -708,6 +708,28 @@
     </div>
   </div>
 
+  <!-- TMDB (original language) -->
+  <div id="tmdb" class="mb-8 p-4 bg-gray-800 rounded">
+    <h3 class="text-xl font-semibold mb-4">TMDB (original language)</h3>
+    <form id="tmdb-form" class="flex gap-2 items-center">
+      <input type="password" name="tmdb_api_key" value="{{ tmdb_api_key }}" placeholder="TMDB API key or read token"
+             autocomplete="off" class="flex-1 px-3 py-2 bg-gray-700 border border-gray-600 rounded text-sm">
+      <button type="submit" class="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 rounded">Save</button>
+      <span id="tmdb-status" class="text-sm text-gray-400"></span>
+    </form>
+    <p class="text-xs text-gray-400 mt-1">Free key at themoviedb.org (Settings, API). Used to highlight the original audio track (VO). Without a key, the language is guessed from the provider's country.</p>
+  </div>
+  <script>
+    document.getElementById('tmdb-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const st = document.getElementById('tmdb-status');
+      try {
+        const r = await fetch('/settings/tmdb', {method: 'POST', body: new URLSearchParams(new FormData(e.target))});
+        st.textContent = r.ok ? 'Saved' : 'Error';
+      } catch (_) { st.textContent = 'Error'; }
+    });
+  </script>
+
   <!-- Sources -->
   <div id="sources" class="mb-8 p-4 bg-gray-800 rounded">
     <h3 class="text-xl font-semibold mb-4">Sources</h3>

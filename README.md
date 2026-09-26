@@ -630,9 +630,8 @@ nvcc --version
 | `m` | Mute |
 | `c` | Toggle captions |
 | `i` | Toggle info overlay |
-| `←` / `→` | Seek ±10s |
+| `←` / `→` | Seek ±5s |
 | `↑` / `↓` | Volume |
-| `j` | Jump to time |
 | `Esc` | Back / close |
 
 ### What Does "neTV" Mean?

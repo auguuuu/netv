@@ -47,25 +47,15 @@
   // Utilities
   // ============================================================
 
+  // Arrow keys seek by this many seconds (streamed, live DVR and local files).
+  const SEEK_STEP = 5;
+
   function formatTime(seconds) {
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = Math.floor(seconds % 60);
     if (h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
     return `${m}:${s.toString().padStart(2, '0')}`;
-  }
-
-  function parseTime(str) {
-    str = str.trim();
-    if (!str) return 0;
-    const parts = str.split(':').map(Number);
-    if (parts.some(isNaN)) return 0;
-    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
-    if (parts.length === 2) return parts[0] * 60 + parts[1];
-    const n = parts[0];
-    if (totalDuration >= 3600 && n * 3600 <= totalDuration) return n * 3600;
-    if (n * 60 <= totalDuration) return n * 60;
-    return n;
   }
 
   function parseVttTime(str) {
@@ -650,8 +640,6 @@
     ccSelectedIdx = null;
     closeTrackMenus();
     updateAudioButton();
-    document.getElementById('menu-jump')?.classList.add('hidden');
-    document.getElementById('seek-container').classList.add('hidden');
     await transcodeSession.stop();
     transcodeSessionId = null;
   }
@@ -834,10 +822,8 @@
       transcodedDuration = data.transcoded_duration || 0;
       currentSubtitles = data.subtitles || null;
       if (cfg.isVod) {
-        document.getElementById('menu-jump')?.classList.remove('hidden');
         document.getElementById('progress-container')?.classList.remove('hidden');
         if (totalDuration > 0) {
-          document.getElementById('seek-duration').textContent = '/ ' + formatTime(totalDuration);
           document.getElementById('time-duration').textContent = formatTime(totalDuration);
         }
         enableCcButton();
@@ -1065,6 +1051,7 @@
       const active = currentHls.audioTrack;
       return currentHls.audioTracks.map((t, i) => ({
         idx: i, lang: t.lang, name: t.name, active: i === active,
+        original: t.original === true || t.attrs?.['X-ORIGINAL'] === 'YES',
         label: Tracks.trackLabel(t.lang, t.name, `Piste ${i + 1}`),
       }));
     }
@@ -1072,15 +1059,28 @@
     if (native && native.length > 0) {
       return Array.from(native).map((t, i) => ({
         idx: i, lang: t.language, name: t.label, active: !!t.enabled,
+        original: t.original === true,
         label: Tracks.trackLabel(t.language, t.label, `Piste ${i + 1}`),
       }));
     }
     return [];
   }
 
+  const AUDIO_BTN_TITLE = audioBtn.title || 'Audio (l)';
+
+  // Original version (VO) among the given audio tracks, or null. The backend
+  // supplies cfg.originalLang / cfg.originalLangSource; both may be absent.
+  function getOriginalInfo(tracks) {
+    return Tracks.findOriginal(tracks, {
+      originalLang: cfg.originalLang || '',
+      source: cfg.originalLangSource || '',
+    });
+  }
+
   function updateAudioButton() {
     const show = getAudioTracks().length >= 2;
     audioBtn.classList.toggle('hidden', !show);
+    audioBtn.title = Tracks.audioButtonTitle(AUDIO_BTN_TITLE, show ? getOriginalInfo(getAudioTracks()) : null);
     if (!show && audioMenu.classList.contains('open')) closeTrackMenus();
     refreshOpenMenu();
   }
@@ -1165,7 +1165,12 @@
 
   function menuEntries(kind) {
     if (kind === 'audio') {
-      return getAudioTracks().map(t => ({ label: t.label, checked: t.active, onSelect: () => selectAudio(t.idx) }));
+      const tracks = getAudioTracks();
+      const vo = getOriginalInfo(tracks);
+      return tracks.map((t, i) => ({
+        label: t.label, checked: t.active, onSelect: () => selectAudio(t.idx),
+        original: vo && vo.idx === i ? vo : null,
+      }));
     }
     const active = getActiveCcIdx();
     const entries = [{ label: 'Désactivés', checked: active < 0, onSelect: () => setCcTrack(-1) }];
@@ -1186,7 +1191,21 @@
       check.className = 'settings-check';
       check.textContent = entry.checked ? '✓' : '';
       item.appendChild(check);
-      item.appendChild(document.createTextNode(entry.label));
+      const text = document.createElement('span');
+      text.className = 'track-label';
+      text.textContent = entry.label;
+      item.appendChild(text);
+      if (entry.original) {
+        const tip = Tracks.originalTitle(entry.original);
+        const badge = document.createElement('span');
+        badge.className = 'vo-badge' + (entry.original.probable ? ' probable' : '');
+        badge.textContent = entry.original.probable ? 'VO ?' : 'VO';
+        badge.setAttribute('aria-hidden', 'true');
+        item.appendChild(badge);
+        item.classList.add('is-original');
+        item.title = tip;
+        item.setAttribute('aria-label', `${entry.label}, ${tip.charAt(0).toLowerCase() + tip.slice(1)}`);
+      }
       item.addEventListener('click', (e) => {
         e.stopPropagation();
         entry.onSelect();
@@ -1275,19 +1294,7 @@
 
   function setupKeyboardControls() {
     document.addEventListener('keydown', (e) => {
-      // In seek input: allow player hotkeys, block other non-time chars
-      if (e.target.id === 'seek-input') {
-        const passthrough = ['j', 'm', 'f', ' ', 'k', 'c', 'i', 'Escape'];
-        if (!passthrough.includes(e.key) && !/^[0-9:]$/.test(e.key) &&
-            !['Backspace', 'Delete', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'Tab', 'Enter'].includes(e.key)) {
-          e.preventDefault();
-          return;
-        }
-        // Let passthrough keys fall through to main handler below
-        if (!passthrough.includes(e.key)) return;
-      }
-      // Skip other input fields entirely
-      else if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
         if (e.key === 'Escape') e.target.blur();
         return;
       }
@@ -1299,8 +1306,8 @@
           e.preventDefault();
           video.paused ? video.play() : video.pause();
           break;
-        case 'ArrowLeft': e.preventDefault(); video.currentTime -= 10; break;
-        case 'ArrowRight': e.preventDefault(); video.currentTime += 10; break;
+        case 'ArrowLeft': e.preventDefault(); video.currentTime -= SEEK_STEP; break;
+        case 'ArrowRight': e.preventDefault(); video.currentTime += SEEK_STEP; break;
         case 'ArrowUp': e.preventDefault(); video.volume = Math.min(1, video.volume + 0.1); break;
         case 'ArrowDown': e.preventDefault(); video.volume = Math.max(0, video.volume - 0.1); break;
         case 'f':
@@ -1323,10 +1330,6 @@
         }
         case 'a': document.getElementById('cast-btn')?.click(); break;
         case 'x': document.getElementById('menu-restart')?.click(); break;
-        case 'j':
-          e.preventDefault();
-          if (cfg.isVod) document.getElementById('jump-btn')?.click();
-          break;
         case 'n': document.getElementById('autonext-btn')?.click(); break;
         case 'p': document.getElementById('pip-btn')?.click(); break;
         case 'h':
@@ -1347,11 +1350,8 @@
           }
           break;
         case 'Escape': {
-          const seekContainer = document.getElementById('seek-container');
           const infoOverlay = document.getElementById('info-overlay');
-          if (seekContainer && !seekContainer.classList.contains('hidden')) {
-            seekContainer.classList.add('hidden');
-          } else if (infoOverlay?.classList.contains('pinned')) {
+          if (infoOverlay?.classList.contains('pinned')) {
             infoOverlay.classList.remove('pinned');
             document.getElementById('info-btn')?.classList.remove('active');
             saveSettings({ infoPinned: false });
@@ -1396,7 +1396,6 @@
 
     function hideControls() {
       if (anyMenuOpen()) return;
-      if (document.getElementById('seek-container')?.classList.contains('hidden') === false) return;
       container.classList.remove('controls-visible');
       activityTimeoutId = null;
     }
@@ -1413,9 +1412,6 @@
   }
 
   function setupButtonHandlers() {
-    const seekContainer = document.getElementById('seek-container');
-    const seekInput = document.getElementById('seek-input');
-
     // Play/Pause button
     document.getElementById('play-btn')?.addEventListener('click', () => {
       video.paused ? video.play() : video.pause();
@@ -1429,7 +1425,7 @@
       container.classList.add('controls-visible');
       clearTimeout(activityTimeoutId);
       activityTimeoutId = setTimeout(() => {
-        if (!anyMenuOpen() && seekContainer.classList.contains('hidden')) {
+        if (!anyMenuOpen()) {
           container.classList.remove('controls-visible');
           activityTimeoutId = null;
         }
@@ -1453,20 +1449,6 @@
     });
     video.addEventListener('volumechange', () => {
       if (volSlider) volSlider.value = video.muted ? 0 : video.volume;
-    });
-
-    // Jump button
-    document.getElementById('jump-btn')?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      seekContainer.classList.toggle('hidden');
-      if (!seekContainer.classList.contains('hidden')) {
-        // Show controls and prevent auto-hide while jump input is active
-        document.getElementById('player-container').classList.add('controls-visible');
-        clearTimeout(activityTimeoutId);
-        activityTimeoutId = null;
-        seekInput.value = '';
-        seekInput.focus();
-      }
     });
 
     // Auto-next button
@@ -1565,19 +1547,6 @@
       }
     });
 
-    document.getElementById('menu-jump')?.addEventListener('click', () => {
-      settingsMenu.classList.remove('open');
-      seekContainer.classList.toggle('hidden');
-      if (!seekContainer.classList.contains('hidden')) {
-        // Show controls and prevent auto-hide while jump input is active
-        document.getElementById('player-container').classList.add('controls-visible');
-        clearTimeout(activityTimeoutId);
-        activityTimeoutId = null;
-        seekInput.value = '';
-        seekInput.focus();
-      }
-    });
-
     document.getElementById('menu-url')?.addEventListener('click', () => {
       settingsMenu.classList.remove('open');
       if (navigator.clipboard) {
@@ -1643,7 +1612,6 @@
     video.addEventListener('loadedmetadata', () => {
       if (cfg.isVod && !transcodeSessionId) {
         document.getElementById('progress-container')?.classList.remove('hidden');
-        document.getElementById('menu-jump')?.classList.remove('hidden');
       }
       updateProgress();
     });
@@ -1670,31 +1638,6 @@
       } else {
         video.currentTime = targetTime;
       }
-    });
-
-    // Seek input handler - filter chars here (must be at input level to block typing)
-    seekInput?.addEventListener('keydown', async function(e) {
-      // Only allow: digits, colon, navigation keys, Enter
-      // Hotkeys and other chars: preventDefault (hotkeys will still bubble to global handler)
-      const typeable = /^[0-9:]$/.test(e.key) ||
-        ['Backspace', 'Delete', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'Tab'].includes(e.key);
-      if (!typeable) e.preventDefault();
-      if (e.key !== 'Enter') return;
-      e.preventDefault();
-      const targetTime = parseTime(seekInput.value);
-      if (targetTime < 0 || targetTime > totalDuration) {
-        seekInput.classList.add('ring-2', 'ring-red-500');
-        setTimeout(() => seekInput.classList.remove('ring-2', 'ring-red-500'), 500);
-        return;
-      }
-      seekContainer.classList.add('hidden');
-      if (cfg.localDownloadId) { video.currentTime = targetTime; return; }
-      const actualTranscodedEnd = seekOffset + transcodedDuration;
-      if (targetTime >= seekOffset && targetTime <= actualTranscodedEnd + 10) {
-        video.currentTime = targetTime - seekOffset;
-        return;
-      }
-      await handleSeekToPosition(targetTime);
     });
   }
 
@@ -2072,11 +2015,9 @@
     transcodedDuration = totalDuration;
     seekOffset = 0;
     if (totalDuration > 0) {
-      document.getElementById('seek-duration').textContent = '/ ' + formatTime(totalDuration);
       document.getElementById('time-duration').textContent = formatTime(totalDuration);
     }
     document.getElementById('progress-container')?.classList.remove('hidden');
-    document.getElementById('menu-jump')?.classList.remove('hidden');
     setupLocalSubtitles(plan);
     localModes = Local.chooseModes(plan, Local.detectCaps(video, window));
     localModeIdx = 0;

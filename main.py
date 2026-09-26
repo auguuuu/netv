@@ -100,6 +100,7 @@ import epg
 import ffmpeg_command
 import ffmpeg_session
 import local_media
+import original_lang
 
 
 log = logging.getLogger()
@@ -1647,6 +1648,79 @@ def _ensure_live_cache() -> None:
             load_all_epg(get_cache().get("epg_urls", []))
 
 
+def _resolve_original_lang(
+    kind: str,
+    item_id: str,
+    source_id: str = "",
+    series_id: int | None = None,
+    local_path: pathlib.Path | None = None,
+    allow_fetch: bool = False,
+) -> tuple[str, str]:
+    """Original language (lang, source) of a movie or episode, never raises.
+
+    Reads provider info from the file cache (already filled by the play page);
+    ``allow_fetch`` lets the API endpoint ask the provider once (get_vod_info).
+    """
+    try:
+        tmdb_id: Any = None
+        country: Any = None
+        tmdb_kind = "movie"
+        if kind == "movie":
+            keys = [f"vod_info_{source_id}_{item_id}", f"vod_info_{item_id}"]
+            data = None
+            for k in keys:
+                cached = load_file_cache(k)
+                if cached and cached[0]:
+                    data = cached[0]
+                    break
+            if data is None and allow_fetch:
+                xtream = get_xtream_client_by_source(source_id) if source_id else None
+                xtream = xtream or get_first_xtream_client()
+                if xtream:
+                    data = get_cached_info(keys[0], lambda: xtream.get_vod_info(int(item_id)))
+            info = (data or {}).get("info") or {}
+            tmdb_id = info.get("tmdb_id") or info.get("tmdb")
+            if not tmdb_id:
+                tmdb_id = ((data or {}).get("movie_data") or {}).get("tmdb")
+            country = info.get("country")
+        else:
+            tmdb_kind = "tv"
+            if series_id:
+                cached = load_file_cache(f"series_info_{source_id}_{series_id}")
+                info = ((cached[0] if cached else None) or {}).get("info") or {}
+                tmdb_id = info.get("tmdb") or info.get("tmdb_id")
+                country = info.get("country")
+        api_key = original_lang.get_api_key(load_server_settings())
+        return original_lang.lookup(
+            cache_dir=CACHE_DIR,
+            tmdb_kind=tmdb_kind,
+            tmdb_id=tmdb_id,
+            api_key=api_key,
+            local_path=local_path,
+            country=country,
+        )
+    except Exception:
+        log.debug("original language lookup failed", exc_info=True)
+        return "", ""
+
+
+@app.get("/api/original-lang")
+async def original_lang_api(
+    _user: Annotated[dict, Depends(require_auth)],
+    kind: str,
+    id: str,
+    source_id: str = "",
+    series_id: int | None = None,
+):
+    """Original language of a movie or episode: {"lang": "en", "source": "tmdb"}."""
+    if kind not in ("movie", "episode"):
+        raise HTTPException(400, "kind must be movie or episode")
+    lang, source = await asyncio.to_thread(
+        _resolve_original_lang, kind, id, source_id, series_id, None, True
+    )
+    return JSONResponse({"lang": lang, "source": source}, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/play/download/{download_id}", response_class=HTMLResponse)
 async def player_download_page(
     request: Request,
@@ -1665,6 +1739,14 @@ async def player_download_page(
     raw_url = str(path)
     is_episode = entry.kind == "episode"
     watch_entry = get_watch_position(username, raw_url)
+    orig_lang, orig_source = await asyncio.to_thread(
+        _resolve_original_lang,
+        "episode" if is_episode else "movie",
+        entry.item_id,
+        entry.source_id,
+        entry.series_id if is_episode else None,
+        path,
+    )
     return TEMPLATES.TemplateResponse(
         request,
         "player.html",
@@ -1691,6 +1773,8 @@ async def player_download_page(
             "next_episode_url": None,
             "deinterlace_fallback": False,
             "source_id": "",
+            "original_lang": orig_lang,
+            "original_lang_source": orig_source,
             "content_access": _get_content_access(username),
         },
     )
@@ -1777,6 +1861,16 @@ async def player_page(
         # Strip year suffix like " (2020)"
         series_name = re.sub(r"\s*\(\d{4}\)$", "", info.channel_name)
 
+    orig_lang, orig_source = "", ""
+    if stream_type in ("movie", "series"):
+        orig_lang, orig_source = await asyncio.to_thread(
+            _resolve_original_lang,
+            "movie" if stream_type == "movie" else "episode",
+            stream_id,
+            info.source_id,
+            series_id,
+        )
+
     return TEMPLATES.TemplateResponse(
         request,
         "player.html",
@@ -1802,6 +1896,8 @@ async def player_page(
             "next_episode_url": next_episode_url,
             "deinterlace_fallback": info.deinterlace_fallback,
             "source_id": info.source_id,
+            "original_lang": orig_lang,
+            "original_lang_source": orig_source,
             "content_access": _get_content_access(username),
         },
     )
@@ -2425,6 +2521,7 @@ async def settings_page(request: Request, user: Annotated[dict, Depends(require_
             "sr_available": is_sr_available(),
             "sr_models": get_sr_models(),
             "sr_model": server_settings.get("sr_model", ""),
+            "tmdb_api_key": server_settings.get("tmdb_api_key", ""),
             "all_users": auth.get_users_with_admin(),
             "all_groups": _build_all_groups(),
             "current_user": username,
@@ -2972,6 +3069,22 @@ async def settings_transcode(
     settings["probe_live"] = probe_live == "on"
     settings["probe_movies"] = probe_movies == "on"
     settings["probe_series"] = probe_series == "on"
+    save_server_settings(settings)
+    return {"ok": True}
+
+
+@app.post("/settings/tmdb")
+async def settings_tmdb(
+    _user: Annotated[dict, Depends(require_admin)],
+    tmdb_api_key: Annotated[str, Form()] = "",
+):
+    """Store the TMDB API key (or v4 read token) used for original languages."""
+    settings = load_server_settings()
+    key = tmdb_api_key.strip()
+    if key:
+        settings["tmdb_api_key"] = key
+    else:
+        settings.pop("tmdb_api_key", None)
     save_server_settings(settings)
     return {"ok": True}
 

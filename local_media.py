@@ -1372,8 +1372,10 @@ def build_router(require_auth: Callable[..., Any]) -> APIRouter:
         except _FAILURES as exc:
             log.warning("local segment failed: %s", exc)
             raise HTTPException(500, "Segment failed") from exc
+        # no-cache: the URLs do not change when a fix changes the segment bytes, and a browser
+        # holding an old segment for minutes would keep playing the old (wrongly aligned) audio
         return FileResponse(
-            path, media_type="video/mp4", headers={"Cache-Control": "private, max-age=600"}
+            path, media_type="video/mp4", headers={"Cache-Control": "private, no-cache"}
         )
 
     def playlist(text: str) -> Response:

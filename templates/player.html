@@ -52,6 +52,13 @@
 .track-menu .settings-item:focus-visible,
 .track-menu .settings-item.focused { background: #374151; outline: 1px solid #60a5fa; outline-offset: -1px; }
 .track-menu .settings-item[aria-checked="true"] { font-weight: 600; }
+.track-menu .settings-item.is-original { color: #fbbf24; font-weight: 700; }
+.vo-badge {
+  margin-left: 0.5rem; padding: 0 0.4rem; border-radius: 9999px;
+  font-size: 0.65rem; font-weight: 700; letter-spacing: 0.04em; line-height: 1.25rem;
+  color: #111827; background: #fbbf24;
+}
+.vo-badge.probable { background: transparent; color: #fbbf24; border: 1px solid #fbbf24; line-height: 1.1rem; }
 #toggle-audio.hidden { display: none; }
 #download-btn { display: inline-flex; align-items: center; gap: 0.2rem; }
 #download-btn[hidden] { display: none; }
@@ -75,11 +82,6 @@
 .ctrl-btn svg { width: 1.25rem; height: 1.25rem; fill: white; }
 #toggle-cc svg, #info-btn svg, #autonext-btn svg { opacity: 0.25; }
 #toggle-cc.active svg, #info-btn.active svg, #autonext-btn.active svg { opacity: 1; }
-/* Seek input */
-#seek-container input {
-  background: rgba(0,0,0,0.7);
-  border: 1px solid #4b5563;
-}
 </style>
 {% endblock %}
 
@@ -125,12 +127,6 @@
           <span id="time-duration">0:00</span>
         </div>
       </div>
-      <!-- Jump input (hidden, shown from menu) -->
-      <div id="seek-container" class="hidden flex items-center gap-2 mb-2 px-1">
-        <input type="text" id="seek-input" placeholder="0:00:00" class="w-20 px-2 py-1 text-xs rounded focus:outline-none focus:ring-1 focus:ring-blue-500" title="Enter time (H:MM:SS)">
-        <span id="seek-duration" class="text-xs text-gray-300"></span>
-      </div>
-
       <div class="flex items-center justify-between">
         <!-- Left controls -->
         <div class="flex items-center gap-1">
@@ -147,11 +143,6 @@
 
         <!-- Right controls -->
         <div class="flex items-center gap-1">
-          {% if stream_type in ['movie', 'series'] %}
-          <button id="jump-btn" class="ctrl-btn" title="Jump (j)">
-            <svg viewBox="0 0 24 24"><path d="M18 4l-4 4h3v7c0 1.1-.9 2-2 2s-2-.9-2-2V9c0-2.21-1.79-4-4-4S5 6.79 5 9v7H2l4 4 4-4H7V9c0-1.1.9-2 2-2s2 .9 2 2v6c0 2.21 1.79 4 4 4s4-1.79 4-4V8h3l-4-4z"/></svg>
-          </button>
-          {% endif %}
           {% if stream_type == 'series' and next_episode_url %}
           <button id="autonext-btn" class="ctrl-btn active" title="Auto-play next (n)">
             <svg viewBox="0 0 24 24"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg>
@@ -189,7 +180,6 @@
             <div id="settings-menu" class="settings-menu bg-gray-800 rounded shadow-lg text-sm">
               <div id="menu-transcode" class="settings-item"><span class="settings-check" id="tc-check"></span>Transcode</div>
               <div id="menu-restart" class="settings-item"><span class="settings-check"></span>Restart transcode</div>
-              <div id="menu-jump" class="settings-item hidden"><span class="settings-check"></span>Jump to time...</div>
               <div class="border-t border-gray-700 my-1"></div>
               <div id="menu-url" class="settings-item"><span class="settings-check"></span>Copy URL</div>
               <div id="menu-external" class="settings-item"><span class="settings-check"></span>Open external</div>
@@ -236,7 +226,9 @@ window.PLAYER_CONFIG = {
   isHttps: {{ (request.url.scheme == 'https') | tojson }},
   deinterlaceFallback: {{ deinterlace_fallback | tojson }},
   sourceId: {{ source_id | tojson }},
-  localDownloadId: {{ local_download_id | default(none) | tojson }}
+  localDownloadId: {{ local_download_id | default(none) | tojson }},
+  originalLang: {{ original_lang | default('') | tojson }},
+  originalLangSource: {{ original_lang_source | default('') | tojson }}
 };
 </script>
 <script src="/static/js/player-quality.js"></script>
