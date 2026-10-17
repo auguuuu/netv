@@ -429,7 +429,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return TEMPLATES.TemplateResponse(
         request,
         "error.html",
-        {"title": f"Error {exc.status_code}", "message": exc.detail},
+        {"title": f"Erreur {exc.status_code}", "message": exc.detail},
         status_code=exc.status_code,
     )
 
@@ -458,7 +458,7 @@ def require_admin(request: Request) -> dict:
     user = require_auth(request)
     username = user.get("sub", "")
     if not auth.is_admin(username):
-        raise HTTPException(403, "Admin access required")
+        raise HTTPException(403, "Accès administrateur requis")
     return user
 
 
@@ -496,15 +496,15 @@ async def setup_create_user(
     # Validate
     if len(username) < 3:
         return TEMPLATES.TemplateResponse(
-            request, "setup.html", {"error": "Username must be at least 3 characters"}
+            request, "setup.html", {"error": "Le nom d'utilisateur doit contenir au moins 3 caractères"}
         )
     if len(password) < 8:
         return TEMPLATES.TemplateResponse(
-            request, "setup.html", {"error": "Password must be at least 8 characters"}
+            request, "setup.html", {"error": "Le mot de passe doit contenir au moins 8 caractères"}
         )
     if password != confirm:
         return TEMPLATES.TemplateResponse(
-            request, "setup.html", {"error": "Passwords do not match"}
+            request, "setup.html", {"error": "Les mots de passe ne correspondent pas"}
         )
     auth.create_user(username, password)
     return RedirectResponse("/login", status_code=303)
@@ -539,7 +539,7 @@ def _check_rate_limit(ip: str) -> None:
         for k in stale[:100]:
             del _login_attempts[k]
     if len(attempts) >= _LOGIN_MAX_ATTEMPTS:
-        raise HTTPException(429, "Too many login attempts, try again later")
+        raise HTTPException(429, "Trop de tentatives de connexion, réessayez plus tard")
 
 
 @app.post("/login")
@@ -727,7 +727,7 @@ async def guide_page(
                     "time_markers": [],
                     "offset": offset,
                     "window_start": "",
-                    "loading_message": "Loading channel data...",
+                    "loading_message": "Chargement des chaînes…",
                     "channel_count": 0,
                     "loading": True,
                 },
@@ -1109,7 +1109,7 @@ async def vod_page(
     # Check if user has access to any movies
     content_access = _get_content_access(username)
     if not content_access["movies"]:
-        raise HTTPException(403, "Access to movies is restricted")
+        raise HTTPException(403, "L'accès aux films est restreint")
 
     # Get user's unavailable groups for filtering
     user_limits = auth.get_user_limits(username)
@@ -1195,7 +1195,7 @@ async def api_discover(
         get_cache()["vod_streams"] = data["streams"]
     username = user.get("sub", "")
     if not _get_content_access(username)["movies"]:
-        raise HTTPException(403, "Access to movies is restricted")
+        raise HTTPException(403, "L'accès aux films est restreint")
     unavailable = frozenset(auth.get_user_limits(username).get("unavailable_groups", []))
     vod_filter = frozenset(str(c) for c in load_user_settings(username).get("vod_filter", []))
     rows = await asyncio.to_thread(
@@ -1272,7 +1272,7 @@ async def series_page(
     # Check if user has access to any series
     content_access = _get_content_access(username)
     if not content_access["series"]:
-        raise HTTPException(403, "Access to series is restricted")
+        raise HTTPException(403, "L'accès aux séries est restreint")
 
     # Get user's unavailable groups for filtering
     user_limits = auth.get_user_limits(username)
@@ -1360,14 +1360,14 @@ async def series_detail_page(
             user_limits = auth.get_user_limits(username)
             unavailable_groups = set(user_limits.get("unavailable_groups", []))
             if f"series:{source_id}" in unavailable_groups:
-                raise HTTPException(403, "Access to this series is restricted")
+                raise HTTPException(403, "L'accès à cette série est restreint")
 
     # Use the series' source, fall back to first Xtream source
     xtream = get_xtream_client_by_source(source_id) if source_id else None
     if not xtream:
         xtream = get_first_xtream_client()
     if not xtream:
-        raise HTTPException(404, "No Xtream source configured")
+        raise HTTPException(404, "Aucune source Xtream configurée")
     cache_key = f"series_info_{source_id}_{series_id}" if source_id else f"series_info_{series_id}"
     try:
         series_data = await asyncio.to_thread(
@@ -1378,8 +1378,8 @@ async def series_detail_page(
             request,
             "error.html",
             {
-                "title": "Provider Error",
-                "message": f"Failed to load series info: {e}",
+                "title": "Erreur du fournisseur",
+                "message": f"Impossible de charger les informations de la série : {e}",
             },
             status_code=502,
         )
@@ -1461,7 +1461,7 @@ async def movie_detail_page(
         user_limits = auth.get_user_limits(username)
         unavailable_groups = set(user_limits.get("unavailable_groups", []))
         if f"movies:{source_id}" in unavailable_groups:
-            raise HTTPException(403, "Access to this movie is restricted")
+            raise HTTPException(403, "L'accès à ce film est restreint")
 
     # Fetch detailed movie info
     if movie:
@@ -1867,10 +1867,10 @@ async def player_page(
             _get_series_player_info, stream_id, series_id, ext
         )
     else:
-        raise HTTPException(404, "Invalid stream type")
+        raise HTTPException(404, "Type de flux invalide")
 
     if not info.url:
-        raise HTTPException(404, "Stream not found")
+        raise HTTPException(404, "Flux introuvable")
 
     # Check user's group access
     user_limits = auth.get_user_limits(username)
@@ -1886,16 +1886,16 @@ async def player_page(
         if stream_type == "live" and info.category_ids:
             # Live streams: blocked if any category is unavailable
             if any(f"cat:{cat_id}" in unavailable_groups for cat_id in info.category_ids):
-                raise HTTPException(403, "Access to this channel is restricted")
+                raise HTTPException(403, "L'accès à cette chaîne est restreint")
         elif stream_type == "movie" and info.source_id:
             if f"movies:{info.source_id}" in unavailable_groups:
-                raise HTTPException(403, "Access to movies is restricted")
+                raise HTTPException(403, "L'accès aux films est restreint")
         elif (
             stream_type == "series"
             and info.source_id
             and f"series:{info.source_id}" in unavailable_groups
         ):
-            raise HTTPException(403, "Access to series is restricted")
+            raise HTTPException(403, "L'accès aux séries est restreint")
 
     log.info("Play %s/%s: %s", stream_type, stream_id, info.url)
 
@@ -1983,7 +1983,7 @@ async def live_program_api(
             None,
         )
         if not stream:
-            raise HTTPException(404, "Stream not found")
+            raise HTTPException(404, "Flux introuvable")
         return _get_current_program(stream.get("epg_channel_id") or "")
 
     program = await asyncio.to_thread(lookup)
@@ -2020,7 +2020,7 @@ async def search_page(
         if regex:
             # Limit regex length to prevent ReDoS
             if len(q) > 100:
-                raise HTTPException(400, "Regex pattern too long")
+                raise HTTPException(400, "Expression régulière trop longue")
             try:
                 pattern = re.compile(q, re.IGNORECASE)
 
@@ -2166,7 +2166,7 @@ async def stream_redirect(
 ):
     xtream = get_first_xtream_client()
     if not xtream:
-        raise HTTPException(404, "No Xtream source configured")
+        raise HTTPException(404, "Aucune source Xtream configurée")
     url = xtream.build_stream_url(stream_type, stream_id, ext)
     return RedirectResponse(url, status_code=302)
 
@@ -2675,14 +2675,14 @@ async def settings_add_source(
 ):
     # Validate inputs
     if not name or not name.strip():
-        raise HTTPException(400, "Name is required")
+        raise HTTPException(400, "Le nom est obligatoire")
     if source_type not in ("xtream", "m3u", "epg"):
-        raise HTTPException(400, "Invalid source type")
+        raise HTTPException(400, "Type de source invalide")
     parsed_url = urllib.parse.urlparse(url)
     if parsed_url.scheme not in ("http", "https"):
-        raise HTTPException(400, "URL must use http or https")
+        raise HTTPException(400, "L'URL doit utiliser http ou https")
     if len(name) > 200:
-        raise HTTPException(400, "Name too long")
+        raise HTTPException(400, "Nom trop long")
 
     # Parse schedule times
     schedule_list = []
@@ -2733,14 +2733,14 @@ async def settings_edit_source(
 ):
     # Validate inputs
     if not name or not name.strip():
-        raise HTTPException(400, "Name is required")
+        raise HTTPException(400, "Le nom est obligatoire")
     if source_type not in ("xtream", "m3u", "epg"):
-        raise HTTPException(400, "Invalid source type")
+        raise HTTPException(400, "Type de source invalide")
     parsed_url = urllib.parse.urlparse(url)
     if parsed_url.scheme not in ("http", "https"):
-        raise HTTPException(400, "URL must use http or https")
+        raise HTTPException(400, "L'URL doit utiliser http ou https")
     if len(name) > 200:
-        raise HTTPException(400, "Name too long")
+        raise HTTPException(400, "Nom trop long")
 
     # Parse schedule times (comma-separated HH:MM)
     schedule_list = []
@@ -3334,16 +3334,16 @@ async def settings_delete_user(
     current_user = user.get("sub", "")
     if username == current_user:
         if not password or not auth.verify_password(username, password):
-            raise HTTPException(400, "Password required to delete your own account")
+            raise HTTPException(400, "Mot de passe requis pour supprimer votre propre compte")
         auth.delete_user(username)
         response = RedirectResponse("/login", status_code=303)
         response.delete_cookie("token")
         return response
     # Deleting other users requires admin
     if not auth.is_admin(current_user):
-        raise HTTPException(403, "Admin access required")
+        raise HTTPException(403, "Accès administrateur requis")
     if not auth.delete_user(username):
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Utilisateur introuvable")
     return RedirectResponse("/settings", status_code=303)
 
 
@@ -3359,11 +3359,11 @@ async def settings_add_user(
     """Add a new user."""
     username = username.strip()
     if not username or len(username) < 2:
-        raise HTTPException(400, "Username must be at least 2 characters")
+        raise HTTPException(400, "Le nom d'utilisateur doit contenir au moins 2 caractères")
     if len(password) < 8:
-        raise HTTPException(400, "Password must be at least 8 characters")
+        raise HTTPException(400, "Le mot de passe doit contenir au moins 8 caractères")
     if username in auth.get_all_usernames():
-        raise HTTPException(400, "User already exists")
+        raise HTTPException(400, "Cet utilisateur existe déjà")
     auth.create_user(username, password, admin=admin == "on")
     # Apply limits if provided
     parsed_max_streams = None
@@ -3388,11 +3388,11 @@ async def settings_change_own_password(
     """Change own password. Requires current password verification."""
     username = user.get("sub", "")
     if not auth.verify_password(username, current_password):
-        raise HTTPException(400, "Current password is incorrect")
+        raise HTTPException(400, "Le mot de passe actuel est incorrect")
     if len(new_password) < 8:
-        raise HTTPException(400, "Password must be at least 8 characters")
+        raise HTTPException(400, "Le mot de passe doit contenir au moins 8 caractères")
     if not auth.change_password(username, new_password):
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Utilisateur introuvable")
     return {"status": "ok"}
 
 
@@ -3405,11 +3405,11 @@ async def settings_change_password(
     """Change a user's password. Own password or admin required."""
     current_user = user.get("sub", "")
     if target_user != current_user and not auth.is_admin(current_user):
-        raise HTTPException(403, "Admin access required")
+        raise HTTPException(403, "Accès administrateur requis")
     if len(new_password) < 8:
-        raise HTTPException(400, "Password must be at least 8 characters")
+        raise HTTPException(400, "Le mot de passe doit contenir au moins 8 caractères")
     if not auth.change_password(target_user, new_password):
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Utilisateur introuvable")
     return {"status": "ok"}
 
 
@@ -3421,7 +3421,7 @@ async def settings_set_admin(
 ):
     """Set admin status for a user."""
     if not auth.set_admin(target_user, admin == "on"):
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Utilisateur introuvable")
     return {"status": "ok"}
 
 
@@ -3452,7 +3452,7 @@ async def settings_set_user_limits(
             raise HTTPException(400, "Invalid JSON for unavailable_groups") from err
 
     if not auth.set_user_limits(target_user, parsed_max_streams, parsed_unavailable):
-        raise HTTPException(404, "User not found")
+        raise HTTPException(404, "Utilisateur introuvable")
     return {"status": "ok"}
 
 

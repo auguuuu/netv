@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Series - neTV{% endblock %}
+{% block title %}Séries - neTV{% endblock %}
 
 {% block head_extra %}
 {% if loading %}
@@ -10,23 +10,23 @@
 {% block content %}
 {% if loading %}
 <div class="flex flex-col h-full items-center justify-center">
-  <p class="text-xl text-gray-400">Loading series...</p>
+  <p class="text-xl text-gray-400">Chargement des séries…</p>
 </div>
 {% else %}
 <div class="flex flex-col h-full min-h-0 min-w-0">
   <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
-    <h2 class="text-xl sm:text-3xl font-bold">Series</h2>
+    <h2 class="text-xl sm:text-3xl font-bold">Séries</h2>
     <div class="flex gap-2">
       <a href="/search?series=true" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
-        Search
+        Rechercher
       </a>
       {% if current_sort %}
       <a href="/series" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
-        Favorites
+        Favoris
       </a>
       {% else %}
       <a href="/series?sort=rating" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
-        Browse All
+        Tout parcourir
       </a>
       {% endif %}
     </div>
@@ -37,7 +37,7 @@
   <div class="flex-1 min-h-0 overflow-auto scroll-ring-safe">
     <div class="mb-4 flex gap-2">
       <select id="category-select" class="bg-gray-700 text-white px-4 py-2 rounded">
-        <option value="">All Categories</option>
+        <option value="">Toutes les catégories</option>
         {% for cat in categories %}
         <option value="{{ cat.category_id }}" {% if current_category|string == cat.category_id|string %}selected{% endif %}>
           {{ cat.category_name }}
@@ -46,8 +46,8 @@
       </select>
       <select id="sort-select" class="bg-gray-700 text-white px-4 py-2 rounded">
         <option value="alpha" {% if current_sort == 'alpha' %}selected{% endif %}>A-Z</option>
-        <option value="rating" {% if current_sort == 'rating' %}selected{% endif %}>Rating</option>
-        <option value="newest" {% if current_sort == 'newest' %}selected{% endif %}>Newest</option>
+        <option value="rating" {% if current_sort == 'rating' %}selected{% endif %}>Note</option>
+        <option value="newest" {% if current_sort == 'newest' %}selected{% endif %}>Plus récents</option>
       </select>
       {% include "_lang_select.html" %}
     </div>
@@ -58,12 +58,12 @@
   {% else %}
   <!-- Favorites view -->
   <div id="favorites-section" class="flex-1 min-h-0 overflow-auto scroll-ring-safe">
-    <h3 class="text-xl font-semibold mb-4">★ My Favorites</h3>
+    <h3 class="text-xl font-semibold mb-4">★ Mes favoris</h3>
     <div id="favorites-grid" class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 pb-4">
     </div>
     <div id="no-favorites" class="hidden text-center text-gray-400 py-12">
-      <p class="text-xl mb-2">No favorites yet</p>
-      <p>Use Search or Browse All to find series, then click ☆ to add</p>
+      <p class="text-xl mb-2">Aucun favori pour le moment</p>
+      <p>Utilisez Rechercher ou Tout parcourir pour trouver des séries, puis cliquez sur ☆ pour les ajouter</p>
     </div>
   </div>
   {% endif %}

@@ -39,7 +39,7 @@ test('resolution labels match Apple, including letterboxed video', () => {
     const { badge, classes, attributes } = player(width, height);
     assert.equal(badge.textContent, label);
     assert.equal(classes.has('hidden'), false);
-    assert.equal(attributes.get('aria-label'), `Video resolution: ${label}`);
+    assert.equal(attributes.get('aria-label'), `Résolution vidéo : ${label}`);
   }
 });
 

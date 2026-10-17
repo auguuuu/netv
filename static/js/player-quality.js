@@ -27,7 +27,7 @@
       : resolution >= 400 ? '480p'
       : 'SD';
     badge.textContent = label;
-    badge.setAttribute('aria-label', `Video resolution: ${label}`);
+    badge.setAttribute('aria-label', `Résolution vidéo : ${label}`);
     badge.classList.remove('hidden');
   }
 

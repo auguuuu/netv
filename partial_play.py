@@ -178,7 +178,7 @@ def start(download_id: str, audio: int = -1) -> Session:
     manager = downloads.get_manager()
     entry = manager.get(download_id)
     if entry is None:
-        raise HTTPException(404, "Download not found")
+        raise HTTPException(404, "Téléchargement introuvable")
     with _lock:
         sess = _sessions.get(download_id)
     if sess is not None and sess.proc.poll() not in (None, 0):
@@ -192,19 +192,19 @@ def start(download_id: str, audio: int = -1) -> Session:
     try:
         path = manager._part(entry)
     except ValueError as exc:
-        raise HTTPException(400, "Invalid file name") from exc
+        raise HTTPException(400, "Nom de fichier invalide") from exc
     if not path.is_file() or path.stat().st_size < MIN_BYTES:
-        raise HTTPException(409, "Not enough data yet")
+        raise HTTPException(409, "Pas encore assez de données téléchargées")
     try:
         probe = remux.ffprobe(path, timeout=30)
     except Exception as exc:
-        raise HTTPException(409, "The beginning of the file cannot be read yet") from exc
+        raise HTTPException(409, "Le début du fichier n'est pas encore lisible") from exc
     codec = video_codec(probe)
     if codec not in remux.COPY_VIDEO:
-        raise HTTPException(415, "This file can only be played once the download is complete")
+        raise HTTPException(415, "Ce fichier ne pourra être lu qu'une fois le téléchargement terminé")
     tracks = remux.list_audio(probe)
     if not tracks:
-        raise HTTPException(415, "No audio track")
+        raise HTTPException(415, "Aucune piste audio")
     if not 0 <= audio < len(tracks):
         audio = remux.choose_audio(tracks, "", entry.audio_pref)[0]
     subs = list_text_subs(probe)

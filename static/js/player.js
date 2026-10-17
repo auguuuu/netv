@@ -106,7 +106,7 @@
     adaptivePlayback = null;
     hideLoading();
     const text = document.getElementById('error-message');
-    if (text) text.textContent = message || 'Failed to load stream';
+    if (text) text.textContent = message || 'Impossible de charger le flux';
     document.getElementById('error-dismiss')?.classList.toggle('hidden', !canDismiss);
     error.classList.remove('hidden');
   }
@@ -697,7 +697,7 @@
         lastError = e;
       }
       if (attempt < SEEK_CLIENT_RETRIES) {
-        showSeekStatus('Retrying...');
+        showSeekStatus('Nouvelle tentative…');
         await seekDelay(400);
         if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
       }
@@ -725,7 +725,7 @@
     seekInProgress = true;
     failedSeekTarget = null;
     showLoading();
-    showSeekStatus('Seeking...');
+    showSeekStatus('Déplacement…');
     error.classList.add('hidden');
     video.pause();
     // Keep the last picture: only stop the old stream from loading while we wait
@@ -745,7 +745,7 @@
       seekInProgress = false;
       failedSeekTarget = targetTime;
       showSeekStatus('');
-      showError('Seek failed', true);
+      showError('Impossible de se déplacer dans la vidéo', true);
       return false;
     }
     if (myId !== seekRequestId) return false;
@@ -796,7 +796,7 @@
     // A stuck flag used to swallow every later seek after a fatal error
     seekInProgress = false;
     failedSeekTarget = targetTime;
-    showError('Seek failed', true);
+    showError('Impossible de se déplacer dans la vidéo', true);
   }
 
   async function startTranscode(onError) {
@@ -1768,7 +1768,7 @@
       this.blur();
       settingsMenu.classList.remove('open');
       if (!window.cast || !cast.framework) {
-        alert('Cast not available.\n\nTry accessing via your LAN IP instead of 0.0.0.0');
+        alert('Cast indisponible.\n\nEssayez d’accéder à neTV via son adresse IP sur le réseau local plutôt que 0.0.0.0');
         return;
       }
       if (Date.now() - castDialogClosedAt < 1000) return;

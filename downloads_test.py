@@ -307,7 +307,7 @@ def test_disk_space_refusal(tmp_path: Path, provider: FakeProvider) -> None:
     mgr = make_manager(tmp_path, provider, min_free=10**18)
     e = mgr.add("movie", "1", title="Huge")
     wait_for(lambda: e.status == "error")
-    assert "disk space" in (e.error or "").lower()
+    assert "espace disque" in (e.error or "").lower()
     assert not list(mgr.dir.glob("*.part")) or (mgr.dir / "Huge.mkv.part").stat().st_size == 0
 
 
@@ -321,7 +321,7 @@ def test_http_error_and_html_page(tmp_path: Path, provider: FakeProvider) -> Non
     provider.content_type = "text/html"
     f = mgr.add("movie", "2", title="Html")
     wait_for(lambda: f.status == "error")
-    assert "error page" in (f.error or "")
+    assert "page d'erreur" in (f.error or "")
     provider.content_type = "video/mp4"
     mgr.resume(e.id)  # error entries can be retried
     wait_for(lambda: e.status == "done")
@@ -332,7 +332,7 @@ def test_network_down_ends_in_error(tmp_path: Path, provider: FakeProvider) -> N
     provider.close()
     e = mgr.add("movie", "1", title="Down")
     wait_for(lambda: e.status == "error")
-    assert "Network error" in (e.error or "")
+    assert "Erreur réseau" in (e.error or "")
 
 
 def test_path_traversal(tmp_path: Path, provider: FakeProvider) -> None:

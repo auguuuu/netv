@@ -443,7 +443,7 @@ class DownloadManager:
                     entry.bytes_total = entry.bytes_done
                 except OSError:
                     entry.status = "error"
-                    entry.error = "File is missing"
+                    entry.error = "Fichier introuvable"
             elif entry.status == "paused":
                 try:
                     entry.bytes_done = self._part(entry).stat().st_size
@@ -625,13 +625,13 @@ class DownloadManager:
     def file_for(self, download_id: str) -> tuple[Entry, pathlib.Path]:
         e = self._require(download_id)
         if e.status != "done":
-            raise HTTPException(409, "Download is not finished")
+            raise HTTPException(409, "Le téléchargement n'est pas terminé")
         try:
             path = self.safe_path(e.filename)
         except ValueError as exc:
-            raise HTTPException(400, "Invalid file name") from exc
+            raise HTTPException(400, "Nom de fichier invalide") from exc
         if not path.is_file():
-            raise HTTPException(404, "File is missing")
+            raise HTTPException(404, "Fichier introuvable")
         return e, path
 
     def free_bytes(self) -> int:
@@ -732,7 +732,7 @@ class DownloadManager:
     def _require(self, download_id: str) -> Entry:
         e = self._entries.get(download_id)
         if not e:
-            raise HTTPException(404, "Download not found")
+            raise HTTPException(404, "Téléchargement introuvable")
         return e
 
     @staticmethod
@@ -846,7 +846,7 @@ class DownloadManager:
             self._fail(e, str(exc))
         except Exception as exc:
             log.exception("Download %s crashed", e.filename)
-            self._fail(e, f"Unexpected error: {exc}")
+            self._fail(e, f"Erreur inattendue : {exc}")
         finally:
             with self._lock:
                 self._running.pop(e.id, None)
@@ -890,14 +890,14 @@ class DownloadManager:
                         return
                     self._unlink(part)  # our offset is bogus, start again
                 elif exc.code not in RETRYABLE_HTTP:
-                    raise _Fatal(f"Provider answered HTTP {exc.code} {exc.reason}") from exc
+                    raise _Fatal(f"Le fournisseur a répondu HTTP {exc.code} {exc.reason}") from exc
                 err: Exception = exc
             except (TimeoutError, OSError, http.client.HTTPException, ValueError) as exc:
                 err = exc
             after = part.stat().st_size if part.exists() else 0
             attempts = 0 if after > before else attempts + 1
             if attempts > self.max_retries:
-                raise _Fatal(f"Network error: {err}") from err
+                raise _Fatal(f"Erreur réseau : {err}") from err
             delay = self.backoff * (2 ** max(attempts - 1, 0))
             log.info("Download %s: %s, retry in %.1fs", e.filename, err, delay)
             if ctl.stop.wait(delay):
@@ -919,7 +919,7 @@ class DownloadManager:
             code = getattr(resp, "status", 200)
             ctype = resp.headers.get_content_type()
             if ctype.startswith("text/") or ctype in ("application/json", "application/xml"):
-                raise _Fatal("Provider returned an error page instead of a video")
+                raise _Fatal("Le fournisseur a renvoyé une page d'erreur au lieu d'une vidéo")
             total = 0
             if code == 206:
                 m = re.match(r"bytes (\d+)-\d+/(\d+|\*)", resp.headers.get("Content-Range", ""))
@@ -938,8 +938,8 @@ class DownloadManager:
             needed = max(total - have, 0) + self.min_free
             if self.free_bytes() < needed:
                 raise _Fatal(
-                    f"Not enough disk space (need {needed // 1024**2} MB free, "
-                    f"have {self.free_bytes() // 1024**2} MB)"
+                    f"Espace disque insuffisant (il faut {needed // 1024**2} Mo libres, "
+                    f"{self.free_bytes() // 1024**2} Mo disponibles)"
                 )
             samples = self._samples.setdefault(e.id, deque(maxlen=200))
             watch = self._watches.setdefault(e.id, self._slow_watch())
@@ -962,7 +962,7 @@ class DownloadManager:
                         f.write(chunk)
                     except OSError as exc:
                         if exc.errno == errno.ENOSPC:
-                            raise _Fatal("Disk is full") from exc
+                            raise _Fatal("Disque plein") from exc
                         raise
                     done += len(chunk)
                     e.bytes_done = done
@@ -981,7 +981,7 @@ class DownloadManager:
         if total and done < total:
             return False
         if total and done > total:
-            raise _Fatal("Received more data than announced")
+            raise _Fatal("Plus de données reçues qu'annoncé")
         self._finalize(e, ctl, part, done)
         return True
 
@@ -1031,7 +1031,7 @@ def build_provider_url(entry: Entry) -> str:
     src = _pick_source(entry.source_id)
     client = get_xtream_client_by_source(src.id) if src else None
     if not client:
-        raise _Fatal("Source is not configured any more")
+        raise _Fatal("La source n'est plus configurée")
     stream_type = "movie" if entry.kind == "movie" else "series"
     return client.build_stream_url(stream_type, int(entry.item_id), entry.src_ext or entry.ext)
 

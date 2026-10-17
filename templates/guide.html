@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Live TV - neTV{% endblock %}
+{% block title %}TV en direct - neTV{% endblock %}
 
 {% block head_extra %}
 {% if loading and not request.query_params.get('refreshing') %}
@@ -49,21 +49,21 @@
   <!-- Desktop header (fixed, non-scrolling) -->
   <div class="desktop-only flex items-center justify-between gap-2 mb-4 h-10">
     <div class="min-w-0 flex items-center gap-2 flex-shrink-0">
-      <h2 class="text-xl sm:text-3xl font-bold">Live TV</h2>
+      <h2 class="text-xl sm:text-3xl font-bold">TV en direct</h2>
       {% if saved_filter or selected_cats %}
       <!-- Category filter multi-select dropdown -->
       <div class="inline-block" id="category-dropdown">
         <button type="button" id="category-dropdown-btn"
                 class="bg-gray-700 text-sm rounded px-2 py-1 border border-gray-600 hover:border-gray-500 focus:border-blue-500 focus:outline-none inline-flex items-center gap-1">
-          <span>{% if effective_cats.split(',') | length < ordered_filter_cats | length %}{{ effective_cats.split(',') | length }} selected{% else %}All categories{% endif %}</span>
+          <span>{% if effective_cats.split(',') | length < ordered_filter_cats | length %}{{ effective_cats.split(',') | length }} sélectionnées{% else %}Toutes les catégories{% endif %}</span>
           <svg class="w-3 h-3 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
         </button>
       </div>
       <!-- Dropdown menu (portal, positioned via JS) -->
       <div id="category-dropdown-menu" class="hidden fixed top-0 left-0 bg-gray-800 border border-gray-600 rounded shadow-lg z-[9999] min-w-[200px] max-h-[300px] overflow-y-auto">
         <div class="p-2 border-b border-gray-700 flex gap-2">
-          <button type="button" onclick="document.querySelectorAll('#category-dropdown-menu .cat-checkbox').forEach(c=>c.checked=true)" class="text-xs text-blue-400 hover:text-blue-300">All</button>
-          <button type="button" onclick="document.querySelectorAll('#category-dropdown-menu .cat-checkbox').forEach(c=>c.checked=false)" class="text-xs text-blue-400 hover:text-blue-300">None</button>
+          <button type="button" onclick="document.querySelectorAll('#category-dropdown-menu .cat-checkbox').forEach(c=>c.checked=true)" class="text-xs text-blue-400 hover:text-blue-300">Toutes</button>
+          <button type="button" onclick="document.querySelectorAll('#category-dropdown-menu .cat-checkbox').forEach(c=>c.checked=false)" class="text-xs text-blue-400 hover:text-blue-300">Aucune</button>
         </div>
         {% for cat in ordered_filter_cats %}
         <label class="flex items-center gap-2 px-3 py-1.5 hover:bg-gray-700 cursor-pointer text-sm">
@@ -98,22 +98,22 @@
         window.location.href = url;
       }
       </script>
-      <span class="text-xs text-gray-500">({{ total_count | default(channel_count) }} ch)</span>
-      <a href="/settings#filters" class="text-xs text-gray-500 hover:text-blue-400">[edit]</a>
+      <span class="text-xs text-gray-500">({{ total_count | default(channel_count) }} chaînes)</span>
+      <a href="/settings#filters" class="text-xs text-gray-500 hover:text-blue-400">[modifier]</a>
       {% endif %}
     </div>
     <div class="flex gap-1">
       <a href="/guide?offset={{ offset - 3 }}{% if cats_param %}&cats={{ cats_param }}{% endif %}"
          class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded focusable" tabindex="0">
-        &larr; Earlier
+        &larr; Plus tôt
       </a>
       <a href="/guide?offset=0{% if cats_param %}&cats={{ cats_param }}{% endif %}"
          class="px-2 py-1 text-xs bg-blue-600 hover:bg-blue-700 rounded focusable" tabindex="0">
-        Now
+        Maintenant
       </a>
       <a href="/guide?offset={{ offset + 3 }}{% if cats_param %}&cats={{ cats_param }}{% endif %}"
          class="px-2 py-1 text-xs bg-gray-600 hover:bg-gray-500 rounded focusable" tabindex="0">
-        Later &rarr;
+        Plus tard &rarr;
       </a>
     </div>
   </div>
@@ -124,29 +124,29 @@
   </div>
   {% elif epg_error %}
   <div class="bg-red-900/50 border border-red-500 rounded p-2 sm:p-4 mb-2 sm:mb-4">
-    <p class="text-red-300 text-sm sm:text-base">EPG Error: {{ epg_error }}</p>
-    <p class="text-xs sm:text-sm text-gray-400 mt-1">Showing channels without program info</p>
+    <p class="text-red-300 text-sm sm:text-base">Erreur du guide TV : {{ epg_error }}</p>
+    <p class="text-xs sm:text-sm text-gray-400 mt-1">Chaînes affichées sans informations de programme</p>
   </div>
   {% endif %}
 
   <!-- Mobile header (outside scroll container, stays visible in portrait, hidden in landscape) -->
   <div class="compact-only mobile-header items-center justify-between gap-1 p-2 bg-gray-900 border-b border-gray-700 rounded-t-lg">
     <div class="flex items-center gap-1">
-      <span class="text-sm font-bold">Live TV</span>
+      <span class="text-sm font-bold">TV en direct</span>
       {% if saved_filter or selected_cats %}
       <!-- Mobile category filter multi-select -->
       <div class="inline-block" id="category-dropdown-mobile">
         <button type="button" id="category-dropdown-btn-mobile"
                 class="bg-gray-700 text-[10px] rounded px-1 py-0.5 border border-gray-600 inline-flex items-center gap-0.5 max-w-[100px]">
-          <span class="truncate">{% if effective_cats.split(',') | length < ordered_filter_cats | length %}{{ effective_cats.split(',') | length }} sel{% else %}All{% endif %}</span>
+          <span class="truncate">{% if effective_cats.split(',') | length < ordered_filter_cats | length %}{{ effective_cats.split(',') | length }} sél.{% else %}Toutes{% endif %}</span>
           <svg class="w-2 h-2 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
         </button>
       </div>
       <!-- Mobile dropdown menu (portal) -->
       <div id="category-dropdown-menu-mobile" class="hidden fixed top-0 left-0 bg-gray-800 border border-gray-600 rounded shadow-lg z-[9999] min-w-[160px] max-h-[250px] overflow-y-auto">
         <div class="p-1.5 border-b border-gray-700 flex gap-2">
-          <button type="button" onclick="document.querySelectorAll('#category-dropdown-menu-mobile .cat-checkbox-mobile').forEach(c=>c.checked=true)" class="text-[10px] text-blue-400">All</button>
-          <button type="button" onclick="document.querySelectorAll('#category-dropdown-menu-mobile .cat-checkbox-mobile').forEach(c=>c.checked=false)" class="text-[10px] text-blue-400">None</button>
+          <button type="button" onclick="document.querySelectorAll('#category-dropdown-menu-mobile .cat-checkbox-mobile').forEach(c=>c.checked=true)" class="text-[10px] text-blue-400">Toutes</button>
+          <button type="button" onclick="document.querySelectorAll('#category-dropdown-menu-mobile .cat-checkbox-mobile').forEach(c=>c.checked=false)" class="text-[10px] text-blue-400">Aucune</button>
         </div>
         {% for cat in ordered_filter_cats %}
         <label class="flex items-center gap-1.5 px-2 py-1 hover:bg-gray-700 cursor-pointer text-[11px]">
@@ -187,7 +187,7 @@
       <a href="/guide?offset={{ offset - 2 }}{% if cats_param %}&cats={{ cats_param }}{% endif %}"
          class="px-1 py-0.5 text-[10px] bg-gray-700 rounded focusable" tabindex="0">◀</a>
       <a href="/guide?offset=0{% if cats_param %}&cats={{ cats_param }}{% endif %}"
-         class="px-1 py-0.5 text-[10px] bg-blue-600 rounded focusable" tabindex="0">Now</a>
+         class="px-1 py-0.5 text-[10px] bg-blue-600 rounded focusable" tabindex="0">Maintenant</a>
       <a href="/guide?offset={{ offset + 2 }}{% if cats_param %}&cats={{ cats_param }}{% endif %}"
          class="px-1 py-0.5 text-[10px] bg-gray-700 rounded focusable" tabindex="0">▶</a>
     </div>
@@ -265,7 +265,7 @@
         {% endfor %}
         {% else %}
         <div class="absolute inset-0.5 flex items-center px-1 text-gray-500 text-[10px]">
-          No info
+          Pas d'info
         </div>
         {% endif %}
       </div>
@@ -286,7 +286,7 @@
         {% endfor %}
         {% else %}
         <div class="absolute inset-1 flex items-center px-2 text-gray-500 text-sm">
-          No program info
+          Aucune information de programme
         </div>
         {% endif %}
       </div>
@@ -296,8 +296,8 @@
   {% else %}
   <div class="flex-1 flex items-center justify-center bg-gray-800 rounded-lg">
     <div class="text-center text-gray-400">
-      <p class="text-2xl mb-4">No channels selected</p>
-      <p>Go to <a href="/settings#filters" class="text-blue-400 hover:underline">Settings</a> to configure Live TV category filter</p>
+      <p class="text-2xl mb-4">Aucune chaîne sélectionnée</p>
+      <p>Allez dans les <a href="/settings#filters" class="text-blue-400 hover:underline">Paramètres</a> pour configurer le filtre de catégories de la TV en direct</p>
     </div>
   </div>
   {% endif %}

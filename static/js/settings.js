@@ -161,11 +161,11 @@
         window.location.href = '/login';
       } else {
         const data = await resp.json();
-        if (msgEl) msgEl.textContent = data.detail || 'Failed';
+        if (msgEl) msgEl.textContent = data.detail || 'Échec';
       }
     } catch (e) {
       console.error('Delete self failed:', e);
-      if (msgEl) msgEl.textContent = 'Request failed';
+      if (msgEl) msgEl.textContent = 'La requête a échoué';
     }
   };
 
@@ -196,7 +196,7 @@
 
       const urlInput = document.querySelector('#add-source-form input[name="url"]');
       if (urlInput) {
-        const placeholders = { xtream: 'https://server.com', m3u: 'http://server.com/playlist.m3u', epg: 'http://server.com/epg.xml' };
+        const placeholders = { xtream: 'https://serveur.com', m3u: 'http://serveur.com/playlist.m3u', epg: 'http://serveur.com/epg.xml' };
         urlInput.placeholder = placeholders[this.value] || placeholders.xtream;
       }
     });
@@ -229,16 +229,16 @@
     document.querySelectorAll('.delete-source-btn').forEach(btn => {
       btn.addEventListener('click', async () => {
         const sourceId = btn.dataset.sourceId;
-        if (!confirm('Delete this source?')) return;
+        if (!confirm('Supprimer cette source ?')) return;
         btn.disabled = true;
-        btn.textContent = 'Deleting...';
+        btn.textContent = 'Suppression…';
         try {
           const resp = await fetch(`/settings/delete/${sourceId}`, { method: 'POST' });
           if (resp.ok) location.reload();
           else throw new Error('Delete failed');
         } catch {
           btn.disabled = false;
-          btn.textContent = 'Delete';
+          btn.textContent = 'Supprimer';
         }
       });
     });
@@ -373,10 +373,10 @@
       const orig = el.textContent;
       try {
         await navigator.clipboard.writeText(text);
-        el.textContent = 'Copied!';
+        el.textContent = 'Copié !';
       } catch (e) {
         console.error('Copy failed:', e);
-        el.textContent = 'Failed';
+        el.textContent = 'Échec';
       }
       setTimeout(() => el.textContent = orig, 1500);
     });
@@ -515,7 +515,7 @@
     if (refreshBtn) {
       refreshBtn.addEventListener('click', async () => {
         refreshBtn.disabled = true;
-        refreshBtn.textContent = 'Detecting...';
+        refreshBtn.textContent = 'Détection…';
         try {
           const resp = await fetch('/settings/refresh-encoders', { method: 'POST' });
           if (resp.ok) {
@@ -538,15 +538,15 @@
                 label.classList.toggle('opacity-40', !enabled);
               }
             });
-            refreshBtn.textContent = 'Done!';
+            refreshBtn.textContent = 'Terminé !';
           } else {
-            refreshBtn.textContent = 'Failed';
+            refreshBtn.textContent = 'Échec';
           }
         } catch (e) {
           console.error('Refresh encoders failed:', e);
-          refreshBtn.textContent = 'Failed';
+          refreshBtn.textContent = 'Échec';
         }
-        setTimeout(() => { refreshBtn.textContent = 'Re-detect Hardware'; refreshBtn.disabled = false; }, 1500);
+        setTimeout(() => { refreshBtn.textContent = 'Redétecter le matériel'; refreshBtn.disabled = false; }, 1500);
       });
     }
   }
@@ -585,10 +585,10 @@
 
     clearBtn.addEventListener('click', async () => {
       clearBtn.disabled = true;
-      clearBtn.textContent = 'Deleting...';
+      clearBtn.textContent = 'Vidage…';
       const resp = await saveWithFeedback('/settings/data-cache/clear', { method: 'POST' }, clearBtn);
-      clearBtn.textContent = resp?.ok ? 'Deleted!' : 'Failed';
-      setTimeout(() => { clearBtn.textContent = 'Delete'; clearBtn.disabled = false; }, 2000);
+      clearBtn.textContent = resp?.ok ? 'Vidé !' : 'Échec';
+      setTimeout(() => { clearBtn.textContent = 'Vider'; clearBtn.disabled = false; }, 2000);
     });
   }
 
@@ -610,35 +610,35 @@
         .then(data => {
           const series = data.series || [];
           if (series.length === 0) {
-            listEl.innerHTML = '<div class="text-gray-500 text-sm">No cached probes</div>';
+            listEl.innerHTML = '<div class="text-gray-500 text-sm">Aucune analyse en cache</div>';
             return;
           }
           listEl.innerHTML = series.map(s => {
-            const name = escapeHtml(s.name) || `Series ${s.series_id}`;
+            const name = escapeHtml(s.name) || `Série ${s.series_id}`;
             const episodes = s.episodes || [];
             const mruEp = s.mru != null ? episodes.find(ep => ep.episode_id === s.mru) : null;
-            const mruName = mruEp ? escapeHtml(mruEp.name) || `Episode ${s.mru}` : (s.mru != null ? `Episode ${s.mru}` : null);
+            const mruName = mruEp ? escapeHtml(mruEp.name) || `Épisode ${s.mru}` : (s.mru != null ? `Épisode ${s.mru}` : null);
             return `
               <details class="bg-gray-700 rounded group">
                 <summary class="flex items-center justify-between p-2 cursor-pointer hover:bg-gray-600 rounded text-sm">
                   <div class="flex-1 min-w-0">
                     <span class="font-medium truncate">${name}</span>
-                    <span class="text-gray-400 ml-2">${s.episode_count} ep${s.episode_count > 1 ? 's' : ''}</span>
+                    <span class="text-gray-400 ml-2">${s.episode_count} ép.</span>
                     <span class="text-gray-500 ml-2">${escapeHtml(s.video_codec || '')}/${escapeHtml(s.audio_codec || '')}</span>
-                    ${s.subtitle_count > 0 ? `<span class="text-gray-500 ml-1">+${s.subtitle_count} subs</span>` : ''}
+                    ${s.subtitle_count > 0 ? `<span class="text-gray-500 ml-1">+${s.subtitle_count} s.-titres</span>` : ''}
                   </div>
-                  <button class="clear-series px-2 py-1 text-xs bg-gray-600 hover:bg-red-600 rounded ml-2" data-series="${s.series_id}">Clear</button>
+                  <button class="clear-series px-2 py-1 text-xs bg-gray-600 hover:bg-red-600 rounded ml-2" data-series="${s.series_id}">Vider</button>
                 </summary>
                 <div class="p-2 pt-0 border-t border-gray-600 max-h-48 overflow-y-auto">
                   ${mruName ? `
                     <div class="flex items-center justify-between py-1 text-xs text-blue-400 border-b border-gray-600 mb-1 pb-1">
-                      <span class="truncate mr-2">MRU: ${mruName}</span>
+                      <span class="truncate mr-2">Dernier lu : ${mruName}</span>
                       <button class="clear-mru flex-shrink-0 px-1.5 py-0.5 bg-gray-600 hover:bg-red-600 rounded" data-series="${s.series_id}">×</button>
                     </div>
                   ` : ''}
                   ${episodes.map(ep => `
                     <div class="flex items-center justify-between py-1 text-xs text-gray-400">
-                      <span class="truncate mr-2">${escapeHtml(ep.name) || 'Episode ' + ep.episode_id}${ep.duration ? ` (${formatDuration(ep.duration)})` : ''}${ep.subtitle_count ? ` +${ep.subtitle_count} subs` : ''}</span>
+                      <span class="truncate mr-2">${escapeHtml(ep.name) || 'Épisode ' + ep.episode_id}${ep.duration ? ` (${formatDuration(ep.duration)})` : ''}${ep.subtitle_count ? ` +${ep.subtitle_count} s.-titres` : ''}</span>
                       <button class="clear-episode flex-shrink-0 px-1.5 py-0.5 bg-gray-600 hover:bg-red-600 rounded" data-series="${s.series_id}" data-episode="${ep.episode_id}">×</button>
                     </div>
                   `).join('')}
@@ -648,7 +648,7 @@
           }).join('');
         })
         .catch(() => {
-          listEl.innerHTML = '<div class="text-red-400 text-sm">Failed to load</div>';
+          listEl.innerHTML = '<div class="text-red-400 text-sm">Échec du chargement</div>';
         });
     }
 
@@ -780,16 +780,16 @@
         try {
           const resp = await fetch('/settings/users/add', { method: 'POST', body: form });
           if (resp.ok) {
-            if (msgEl) { msgEl.textContent = 'Added'; msgEl.className = 'text-sm text-green-400'; }
+            if (msgEl) { msgEl.textContent = 'Ajouté'; msgEl.className = 'text-sm text-green-400'; }
             this.reset();
             setTimeout(() => location.reload(), 500);
           } else {
             const data = await resp.json();
-            if (msgEl) { msgEl.textContent = data.detail || 'Failed'; msgEl.className = 'text-sm text-red-400'; }
+            if (msgEl) { msgEl.textContent = data.detail || 'Échec'; msgEl.className = 'text-sm text-red-400'; }
           }
         } catch (e) {
           console.error('Add user failed:', e);
-          if (msgEl) { msgEl.textContent = 'Request failed'; msgEl.className = 'text-sm text-red-400'; }
+          if (msgEl) { msgEl.textContent = 'La requête a échoué'; msgEl.className = 'text-sm text-red-400'; }
         }
         msgEl?.classList.remove('hidden');
         setTimeout(() => { if (msgEl) msgEl.className = 'text-sm hidden'; }, 3000);
