@@ -99,6 +99,7 @@ import downloads
 import epg
 import ffmpeg_command
 import ffmpeg_session
+import line_status
 import local_media
 import original_lang
 import partial_play
@@ -468,6 +469,8 @@ app.include_router(downloads.build_router(require_auth))
 app.include_router(local_media.build_router(require_auth))
 # Watch a download while it is still running: /play/partial/*, /partial/* (partial_play.py)
 app.include_router(partial_play.build_router(require_auth))
+# IPTV line free or busy (sidebar dot): /api/line-status (line_status.py)
+app.include_router(line_status.build_router(require_auth))
 
 
 # =============================================================================
