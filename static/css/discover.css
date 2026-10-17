@@ -1,4 +1,4 @@
-/* Netflix style discovery rows (Movies landing). Plain CSS, matches the neTV dark palette. */
+/* Netflix style discovery rows (Movies and Series landings). Plain CSS, matches the neTV dark palette. */
 #no-favorites { display: none !important; }
 #favorites-section:has(#favorites-grid:empty) #favorites-title { display: none; }
 .disc-fav-row { scroll-snap-type: x proximity; }
@@ -46,3 +46,13 @@
 @keyframes disc-pulse { 50% { opacity: .45; } }
 @media (prefers-reduced-motion: reduce) { .disc-skel * { animation: none !important; } }
 .disc-empty { color: rgb(156 163 175); padding: 2rem 0; text-align: center; }
+
+/* "Voir plus" card at the end of a row, and "Afficher plus" below the rows */
+.disc-more-card .disc-more {
+  aspect-ratio: 2 / 3; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 0.25rem; border-radius: 0.5rem; background: rgb(31 41 55); color: rgb(209 213 219);
+  font-size: 0.9rem; font-weight: 600; text-align: center; transition: background .15s, box-shadow .15s;
+}
+.disc-more-card .disc-more:hover, .disc-more-card .disc-more:focus { background: rgb(55 65 81); color: #fff; box-shadow: 0 0 0 2px rgb(59 130 246); outline: none; }
+.disc-more-icon { font-size: 2.2rem; line-height: 1; }
+.disc-more-rows { display: flex; justify-content: center; padding: 0.5rem 0 1.5rem; }

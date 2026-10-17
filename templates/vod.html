@@ -35,7 +35,7 @@
   {% if current_sort %}
   <!-- Browse view -->
   <div class="flex-1 min-h-0 overflow-auto scroll-ring-safe">
-    <div class="mb-4 flex gap-2">
+    <div class="mb-4 flex flex-wrap items-center gap-2">
       <select id="category-select" class="bg-gray-700 text-white px-4 py-2 rounded">
         <option value="">All Categories</option>
         {% for cat in categories %}
@@ -50,6 +50,11 @@
         <option value="newest" {% if current_sort == 'newest' %}selected{% endif %}>Newest</option>
       </select>
       {% include "_lang_select.html" %}
+      {% if current_platform %}
+      <a href="{{ request.url.remove_query_params(['platform', 'offset']) }}"
+         class="flex items-center gap-1 px-3 py-1 rounded-full bg-blue-700 hover:bg-blue-600 text-sm focusable" tabindex="0"
+         title="Retirer le filtre">{{ current_platform.label }} <span aria-hidden="true">✕</span></a>
+      {% endif %}
     </div>
     <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-7 gap-2 sm:gap-3 pb-4">
       {% include "_vod_cards.html" %}
@@ -73,7 +78,7 @@
         <a href="/vod?sort=rating" class="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 focusable text-sm" tabindex="0">Tout parcourir</a>
       </div>
     </div>
-    <div id="discover-rows" aria-live="polite">
+    <div id="discover-rows" data-kind="movies" aria-live="polite">
       {% for _ in range(3) %}
       <div class="disc-row disc-skel" aria-hidden="true">
         <div class="disc-title-skel"></div>

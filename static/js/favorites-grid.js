@@ -63,6 +63,9 @@
       const sort = document.getElementById('sort-select').value;
       const params = new URLSearchParams();
       if (cat) params.set('category', cat);
+      // Keep a discovery group filter (?platform=netflix) unless a category was picked.
+      const platform = new URLSearchParams(window.location.search).get('platform');
+      if (platform && !cat) params.set('platform', platform);
       params.set('sort', sort);
       const langSel = document.getElementById('lang-select');
       // Explicit "lang=" (even empty) records a deliberate "Toutes" over the remembered choice.
