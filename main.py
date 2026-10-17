@@ -1068,6 +1068,28 @@ def _lang_options(counts: dict[str, int], current: str = "") -> list[dict]:
     return opts
 
 
+def _platform_filter(
+    kind: str, platform: str, categories: list[dict], items: list[dict]
+) -> tuple[dict | None, list[dict]]:
+    """Keep the items of a discovery group (?platform=netflix, cinema, anime...).
+
+    Returns ({"id", "label"} for the template or None, filtered items). Unknown
+    groups are ignored.
+    """
+    import discover
+
+    if not platform:
+        return None, items
+    cat_ids = discover.group_category_ids(kind, platform, categories)
+    if cat_ids is None:
+        return None, items
+    group = discover.find_group(kind, platform)
+    return (
+        {"id": group.id, "label": group.label},
+        [i for i in items if str(i.get("category_id")) in cat_ids],
+    )
+
+
 @app.get("/vod", response_class=HTMLResponse)
 async def vod_page(
     request: Request,
@@ -1076,6 +1098,7 @@ async def vod_page(
     sort: str | None = None,
     lang: str = "",
     offset: int = 0,
+    platform: str = "",
 ):
     lang = _clean_lang(lang)
     # Load from file cache if not in memory (async to avoid blocking)
@@ -1137,6 +1160,7 @@ async def vod_page(
     # Filter by category if specified
     if category:
         streams = [s for s in streams if str(s.get("category_id")) == str(category)]
+    platform_group, streams = _platform_filter("movies", platform, categories, streams)
 
     # Language filter (counts cover the current category, before the language filter)
     lang_names = catalog_lang.category_names(get_cache()["vod_categories"])
@@ -1169,6 +1193,7 @@ async def vod_page(
             "current_category": category,
             "current_sort": sort,
             "current_lang": lang,
+            "current_platform": platform_group,
             "lang_options": lang_options,
             "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
             "content_access": _get_content_access(username),
@@ -1180,33 +1205,43 @@ async def vod_page(
 async def api_discover(
     user: Annotated[dict, Depends(require_auth)],
     lang: str = "",
+    kind: str = "movies",
 ):
-    """Discovery rows for the Movies landing page (cached per catalog, day, lang)."""
+    """Discovery rows for the Movies or Series landing page (cached per catalog, day, lang)."""
     import discover
 
     lang = _clean_lang(lang)
-    if "vod_categories" not in get_cache() or "vod_streams" not in get_cache():
-        cached = await asyncio.to_thread(load_file_cache, "vod_data")
+    if kind not in ("movies", "series"):
+        raise HTTPException(400, "Unknown kind")
+    if kind == "movies":
+        cats_key, items_key, file_key, items_field = "vod_categories", "vod_streams", "vod_data", "streams"
+        start_load, filter_key = _start_vod_background_load, "vod_filter"
+    else:
+        cats_key, items_key, file_key, items_field = "series_categories", "series", "series_data", "series"
+        start_load, filter_key = _start_series_background_load, "series_filter"
+    if cats_key not in get_cache() or items_key not in get_cache():
+        cached = await asyncio.to_thread(load_file_cache, file_key)
         if not cached:
-            _start_vod_background_load()
+            start_load()
             return {"rows": [], "loading": True}
         data, _ = cached
-        get_cache()["vod_categories"] = data["cats"]
-        get_cache()["vod_streams"] = data["streams"]
+        get_cache()[cats_key] = data["cats"]
+        get_cache()[items_key] = data[items_field]
     username = user.get("sub", "")
-    if not _get_content_access(username)["movies"]:
-        raise HTTPException(403, "Access to movies is restricted")
+    if not _get_content_access(username)[kind]:
+        raise HTTPException(403, f"Access to {kind} is restricted")
     unavailable = frozenset(auth.get_user_limits(username).get("unavailable_groups", []))
-    vod_filter = frozenset(str(c) for c in load_user_settings(username).get("vod_filter", []))
+    cat_filter = frozenset(str(c) for c in load_user_settings(username).get(filter_key, []))
     rows = await asyncio.to_thread(
         discover.get_rows,
-        get_cache()["vod_streams"],
-        get_cache()["vod_categories"],
+        get_cache()[items_key],
+        get_cache()[cats_key],
         lang,
         None,
         _logo_url_filter,
         unavailable,
-        vod_filter,
+        cat_filter,
+        kind,
     )
     return {"rows": rows}
 
@@ -1239,6 +1274,7 @@ async def series_page(
     sort: str | None = None,
     lang: str = "",
     offset: int = 0,
+    platform: str = "",
 ):
     lang = _clean_lang(lang)
     # Load from file cache if not in memory (async to avoid blocking)
@@ -1300,6 +1336,7 @@ async def series_page(
     # Filter by category if specified
     if category:
         series = [s for s in series if str(s.get("category_id")) == str(category)]
+    platform_group, series = _platform_filter("series", platform, categories, series)
 
     # Language filter (counts cover the current category, before the language filter)
     lang_names = catalog_lang.category_names(get_cache()["series_categories"])
@@ -1313,6 +1350,8 @@ async def series_page(
         series.sort(key=lambda s: _safe_float(s.get("rating")), reverse=True)
     elif sort == "newest":
         series.sort(key=lambda s: int(s.get("last_modified") or 0), reverse=True)
+    elif sort == "release":
+        series.sort(key=lambda s: str(s.get("releaseDate") or s.get("release_date") or ""), reverse=True)
 
     total = len(series)
     series, next_url = _page_slice(series, offset, request)
@@ -1332,6 +1371,7 @@ async def series_page(
             "current_category": category,
             "current_sort": sort,
             "current_lang": lang,
+            "current_platform": platform_group,
             "lang_options": lang_options,
             "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
             "content_access": _get_content_access(username),

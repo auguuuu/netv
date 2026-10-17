@@ -186,3 +186,113 @@ def test_item_shape_and_poster_fn():
         "ext": "mp4",
         "tmdb": "1",
     }
+
+
+def test_more_urls_movies():
+    s = [mk(1, "[EN] A (2024)", "1"), mk(2, "[NL] G (2024)", "6")]
+    more = {r["id"]: r["more"] for r in rows_for(s)}
+    assert more["recent"] == "/vod?sort=newest&lang="
+    assert more["top"] == "/vod?sort=rating&lang="
+    assert more["netflix"] == "/vod?platform=netflix&sort=newest&lang="
+    assert more["fr_new"] == "/vod?sort=newest&lang=FR"
+    assert more["fr_top"] == "/vod?sort=rating&lang=FR"
+    assert more["cinema"] == "/vod?platform=cinema&sort=newest&lang="
+    assert {r["id"]: r["more"] for r in rows_for(s, lang="NL")}["recent"] == "/vod?sort=newest&lang=NL"
+
+
+SCATS = [
+    {"category_id": "20", "category_name": "FR | NETFLIX", "source_id": "s"},
+    {"category_id": "21", "category_name": "EN | NETFLIX", "source_id": "s"},
+    {"category_id": "22", "category_name": "DE | PRIME SERIEN", "source_id": "s"},
+    {"category_id": "23", "category_name": "FR | CANAL+ / FOX / NBC", "source_id": "s"},
+    {"category_id": "24", "category_name": "ALL | ANIME", "source_id": "s"},
+    {"category_id": "25", "category_name": "DE | ZDF MEDIATHEK", "source_id": "s"},
+    {"category_id": "26", "category_name": "FR I PARAMOUNT +", "source_id": "s"},
+]
+
+
+def smk(sid, name, cat, modified=1000, rating="8", tmdb=None, release="", cover="http://x/c.jpg"):
+    return {
+        "series_id": sid,
+        "name": name,
+        "category_id": cat,
+        "last_modified": str(modified),
+        "rating": rating,
+        "tmdb": str(tmdb if tmdb is not None else sid),
+        "cover": cover,
+        "releaseDate": release,
+        "source_id": "s",
+    }
+
+
+def srows(series, lang="", day="2026-10-17"):
+    return discover.build_rows(discover.build_records(series, SCATS, "series"), lang, day, kind="series")
+
+
+def sids(rows, rid):
+    return [i["series_id"] for r in rows if r["id"] == rid for i in r["items"]]
+
+
+def test_series_records_use_series_fields_and_exclusions():
+    s = [
+        smk(1, "[FR] Lupin (2021)", "20"),
+        smk(2, "No cover (2021)", "20", cover=""),
+        smk(3, "Doku (2020)", "25"),  # MEDIATHEK is excluded like for movies
+        smk(4, "[EN] Dark", "21", release="2017-12-01"),
+    ]
+    r = discover.build_records(s, SCATS, "series")
+    assert [x.item["series_id"] for x in r] == [1, 4]
+    assert r[1].year == 2017  # from releaseDate when the name has no year
+
+
+def test_series_rows_platforms_new_and_dedupe():
+    s = [
+        smk(1, "[FR] Lupin (2021)", "20", modified=50, tmdb=96677),
+        smk(2, "[EN] Lupin (2021)", "21", modified=90, tmdb=96677),
+        smk(3, "[DE] Reacher (2022)", "22", modified=80),
+        smk(4, "[FR] Le Bureau (2015)", "23", modified=70),
+        smk(5, "Frieren (2025)", "24", modified=60, release="2025-01-10"),
+        smk(6, "[FR] Tulsa King (2026)", "26", modified=40, release="2026-09-01"),
+        smk(7, "[FR] Announced (2026)", "26", modified=30, release="2026-12-01"),
+    ]
+    rows = srows(s)
+    ids_ = {r["id"] for r in rows}
+    assert {"recent", "new", "netflix", "prime", "canal", "paramount", "anime", "fr_new"} <= ids_
+    assert sids(rows, "recent") == [1, 3, 4, 5, 6, 7]  # Lupin once, FR variant, newest position
+    assert sids(rows, "netflix") == [1]
+    assert sids(rows, "prime") == [3]
+    assert sids(rows, "canal") == [4]
+    assert sids(rows, "anime") == [5]
+    # Released 2025 or later, latest release first, not yet released ones skipped
+    assert sids(rows, "new") == [6, 5]
+    item = rows[0]["items"][0]
+    assert item["series_id"] == 1 and "ext" not in item and "stream_id" not in item
+    more = {r["id"]: r["more"] for r in rows}
+    assert more["new"] == "/series?sort=release&lang="
+    assert more["canal"] == "/series?platform=canal&sort=newest&lang="
+    assert more["anime"] == "/series?platform=anime&sort=newest&lang="
+    assert next(r for r in rows if r["id"] == "top")["title"] == "Les mieux notées"
+
+
+def test_series_cache_is_separate_from_movies():
+    discover.reset_cache()
+    movies = [mk(i, f"[EN] M{i} (2020)", "1", added=i, tmdb=i) for i in range(1, 12)]
+    series = [smk(i, f"[EN] S{i} (2020)", "21", modified=i, tmdb=i) for i in range(1, 12)]
+    m = discover.get_rows(movies, CATS, day="2026-01-01")
+    s = discover.get_rows(series, SCATS, day="2026-01-01", kind="series")
+    assert discover.get_rows(movies, CATS, day="2026-01-01") is m
+    assert discover.get_rows(series, SCATS, day="2026-01-01", kind="series") is s
+    assert "series_id" in s[0]["items"][0] and "stream_id" in m[0]["items"][0]
+    hidden = discover.get_rows(
+        series, SCATS, day="2026-01-01", kind="series", unavailable_groups=frozenset({"series:s"})
+    )
+    assert hidden == []
+    discover.reset_cache()
+
+
+def test_group_category_ids():
+    assert discover.group_category_ids("series", "netflix", SCATS) == {"20", "21"}
+    assert discover.group_category_ids("series", "prime", SCATS) == {"22"}
+    assert discover.group_category_ids("movies", "cinema", CATS) == {"6"}
+    assert discover.group_category_ids("series", "bogus", SCATS) is None
+    assert discover.group_category_ids("movies", "anime", CATS) is None

@@ -1118,3 +1118,44 @@ def test_vod_and_series_browse_language_filter(auth_client):
     r = auth_client.get("/series?sort=alpha&lang=US").text
     assert "/series/9" in r
     assert "/series/9" not in auth_client.get("/series?sort=alpha&lang=FR").text
+
+
+def test_discover_api_kinds_and_platform_listing(auth_client):
+    import discover
+
+    discover.reset_cache()
+    cache = cache_module.get_cache()
+    cache["series_categories"] = [
+        {"category_id": "5", "category_name": "FR | NETFLIX", "source_id": "s"},
+        {"category_id": "6", "category_name": "EN | NETFLIX", "source_id": "s"},
+        {"category_id": "7", "category_name": "FR | SERIES", "source_id": "s"},
+    ]
+    cache["series"] = [
+        {
+            "name": f"[FR] Serie {i} (2024)",
+            "series_id": i,
+            "category_id": "5" if i % 2 else "6",
+            "source_id": "s",
+            "cover": "http://x/c.jpg",
+            "last_modified": str(i),
+            "releaseDate": f"2024-01-{i:02d}",
+            "tmdb": str(i),
+        }
+        for i in range(1, 9)
+    ] + [{"name": "[FR] Autre (2020)", "series_id": 99, "category_id": "7", "source_id": "s"}]
+    data = auth_client.get("/api/discover?kind=series").json()
+    rows = {r["id"]: r for r in data["rows"]}
+    assert rows["netflix"]["items"][0]["series_id"] == 8
+    assert rows["netflix"]["more"] == "/series?platform=netflix&sort=newest&lang="
+    assert auth_client.get("/api/discover?kind=bogus").status_code == 400
+
+    r = auth_client.get(rows["netflix"]["more"]).text
+    assert "/series/1" in r and "/series/8" in r and "/series/99" not in r
+    assert "Retirer le filtre" in r
+    r = auth_client.get("/series?sort=release&lang=").text
+    assert r.index("/series/8") < r.index("/series/1")
+    # Unknown group: no filter
+    assert "/series/99" in auth_client.get("/series?platform=bogus&sort=alpha").text
+    landing = auth_client.get("/series").text
+    assert 'data-kind="series"' in landing and "/static/js/discover.js" in landing
+    discover.reset_cache()
