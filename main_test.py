@@ -429,6 +429,25 @@ class TestFavicon:
         assert b"<svg" in resp.content
 
 
+class TestOfflineAssets:
+    """Pages must work with no internet: scripts are vendored, only Cast stays remote (async)."""
+
+    def test_templates_load_no_remote_script_but_cast(self):
+        import re
+
+        root = Path(__file__).parent
+        for tpl in (root / "templates").glob("*.html"):
+            for tag in re.findall(r"<script[^>]*\bsrc=\"https?://[^>]*>", tpl.read_text()):
+                assert "gstatic.com/cv/js/sender" in tag, f"{tpl.name}: {tag}"
+                assert re.search(r"\basync\b", tag), f"{tpl.name}: Cast must load async"
+
+    def test_vendored_scripts_are_served(self, client):
+        for name in ("tailwindcss-3.4.17.js", "htmx-2.0.4.min.js", "hls-1.7.3.min.js"):
+            resp = client.get(f"/static/vendor/{name}")
+            assert resp.status_code == 200, name
+            assert len(resp.content) > 10_000, name
+
+
 class TestGuide:
     """Tests for guide page."""
 

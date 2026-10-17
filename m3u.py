@@ -213,6 +213,10 @@ def load_all_live_data() -> tuple[list[dict], list[dict], list[tuple[str, int, s
                 try:
                     log.info("Refreshing live data in background")
                     new_cats, new_streams, new_epg_urls = _fetch_all_live_data()
+                    if not (new_cats or new_streams):
+                        # Every source failed (offline): keep the stale catalog
+                        log.warning("Live refresh got nothing, keeping cached data")
+                        return
                     save_file_cache(
                         "live_data",
                         {"cats": new_cats, "streams": new_streams, "epg_urls": new_epg_urls},
@@ -236,7 +240,8 @@ def load_all_live_data() -> tuple[list[dict], list[dict], list[tuple[str, int, s
             return data["cats"], data["streams"], parse_epg_urls(data.get("epg_urls", []))
         log.info("No live cache, fetching")
         cats, streams, epg_urls = _fetch_all_live_data()
-        save_file_cache("live_data", {"cats": cats, "streams": streams, "epg_urls": epg_urls})
+        if cats or streams:
+            save_file_cache("live_data", {"cats": cats, "streams": streams, "epg_urls": epg_urls})
         return cats, streams, epg_urls
 
 
@@ -275,6 +280,9 @@ def load_vod_data() -> tuple[list[dict], list[dict]]:
                 try:
                     log.info("Refreshing VOD data in background")
                     new_cats, new_streams = _fetch_vod_data()
+                    if not (new_cats or new_streams):
+                        log.warning("VOD refresh got nothing, keeping cached data")
+                        return
                     save_file_cache("vod_data", {"cats": new_cats, "streams": new_streams})
                     with _cache_lock:
                         _cache.pop("vod_categories", None)
@@ -341,6 +349,9 @@ def load_series_data() -> tuple[list[dict], list[dict]]:
                 try:
                     log.info("Refreshing series data in background")
                     new_cats, new_series = _fetch_series_data()
+                    if not (new_cats or new_series):
+                        log.warning("Series refresh got nothing, keeping cached data")
+                        return
                     save_file_cache("series_data", {"cats": new_cats, "series": new_series})
                     with _cache_lock:
                         _cache.pop("series_categories", None)

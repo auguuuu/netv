@@ -289,3 +289,54 @@ if __name__ == "__main__":
     from testing import run_tests
 
     run_tests(__file__)
+
+
+class _InlineThread:
+    """threading.Thread stand-in that runs the target on start() (synchronous refresh)."""
+
+    def __init__(self, target, daemon=None):
+        self._target = target
+
+    def start(self) -> None:
+        self._target()
+
+
+class TestOfflineRefreshKeepsCache:
+    """A stale-cache refresh that gets nothing (offline) must not wipe the catalog."""
+
+    @pytest.mark.parametrize(
+        ("name", "loader", "fetcher", "payload", "empty"),
+        [
+            ("vod_data", "load_vod_data", "_fetch_vod_data",
+             {"cats": [{"category_id": "1"}], "streams": [{"stream_id": 1}]}, ([], [])),
+            ("series_data", "load_series_data", "_fetch_series_data",
+             {"cats": [{"category_id": "1"}], "series": [{"series_id": 1}]}, ([], [])),
+            ("live_data", "load_all_live_data", "_fetch_all_live_data",
+             {"cats": [{"category_id": "1"}], "streams": [{"stream_id": 1}], "epg_urls": []},
+             ([], [], [])),
+        ],
+    )
+    def test_empty_refresh_keeps_stale_data(self, m3u_module, name, loader, fetcher, payload, empty):
+        path = cache.CACHE_DIR / f"{name}.json"
+        path.write_text(json.dumps({"data": payload, "timestamp": 0}))
+        with (
+            patch.object(m3u_module, fetcher, return_value=empty),
+            patch.object(m3u_module.threading, "Thread", _InlineThread),
+        ):
+            result = getattr(m3u_module, loader)()
+        assert result[0] == payload["cats"]
+        assert json.loads(path.read_text()) == {"data": payload, "timestamp": 0}
+        assert not m3u_module.get_refresh_in_progress()
+
+    def test_refresh_with_data_replaces_cache(self, m3u_module):
+        path = cache.CACHE_DIR / "vod_data.json"
+        path.write_text(json.dumps({"data": {"cats": [], "streams": []}, "timestamp": 0}))
+        fresh = ([{"category_id": "2"}], [{"stream_id": 2}])
+        with (
+            patch.object(m3u_module, "_fetch_vod_data", return_value=fresh),
+            patch.object(m3u_module.threading, "Thread", _InlineThread),
+        ):
+            m3u_module.load_vod_data()
+        saved = json.loads(path.read_text())
+        assert saved["data"] == {"cats": fresh[0], "streams": fresh[1]}
+        assert saved["timestamp"] > 0
