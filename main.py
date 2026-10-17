@@ -101,6 +101,7 @@ import ffmpeg_command
 import ffmpeg_session
 import local_media
 import original_lang
+import partial_play
 
 
 log = logging.getLogger()
@@ -177,6 +178,21 @@ def _logo_url_filter(url: str) -> str:
 TEMPLATES.env.filters["logo_url"] = _logo_url_filter
 
 
+PAGE_SIZE = 60
+
+
+def _page_slice(items: list, offset: int, request: Request) -> tuple[list, str]:
+    """Return (items[offset:offset+PAGE_SIZE], url of the next fragment or "")."""
+    offset = max(0, offset)
+    page = items[offset : offset + PAGE_SIZE]
+    nxt = offset + PAGE_SIZE
+    if nxt >= len(items):
+        return page, ""
+    params = [(k, v) for k, v in request.query_params.multi_items() if k != "offset"]
+    params.append(("offset", str(nxt)))
+    return page, f"{request.url.path}?{urllib.parse.urlencode(params)}"
+
+
 def _safe_float(value: float | str | None, default: float = 0.0) -> float:
     """Safely convert value to float, returning default on failure."""
     if value is None:
@@ -229,6 +245,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     ffmpeg_session.cleanup_and_recover_sessions()
 
     # Offline downloads: load the index (running ones come back paused) and start the queue
+    downloads.vo_resolver = lambda e, src: _resolve_original_lang(
+        "episode" if e.kind == "episode" else "movie",
+        e.item_id,
+        e.source_id,
+        e.series_id if e.kind == "episode" else None,
+        src,
+        True,
+    )[0]
+    partial_play.cleanup_leftovers()
     try:
         downloads.startup()
     except Exception:
@@ -356,11 +381,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cleanup_stop.set()
     scheduler_stop.set()
     ffmpeg_session.shutdown()
+    partial_play.shutdown()
     downloads.shutdown()
 
 
 app = FastAPI(title="neTV", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=APP_DIR / "static"), name="static")
+class RevalidatedStaticFiles(StaticFiles):
+    """Static files that the browser must revalidate (ETag) instead of caching heuristically,
+    otherwise an updated player.js is not picked up for days."""
+
+    async def get_response(self, path: str, scope: Any) -> Response:
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
+app.mount("/static", RevalidatedStaticFiles(directory=APP_DIR / "static"), name="static")
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -398,11 +434,17 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
+# NETV_AUTO_LOGIN=<username>: skip the login screen and act as that user
+# (only safe when the server is bound to localhost, see NETV_HOST).
+AUTO_LOGIN_USER = os.environ.get("NETV_AUTO_LOGIN", "")
+
+
 def get_current_user(request: Request) -> dict | None:
     token = request.cookies.get("token")
-    if not token:
-        return None
-    return verify_token(token)
+    payload = verify_token(token) if token else None
+    if payload is None and AUTO_LOGIN_USER:
+        return {"sub": AUTO_LOGIN_USER}
+    return payload
 
 
 def require_auth(request: Request) -> dict:
@@ -424,6 +466,8 @@ def require_admin(request: Request) -> dict:
 app.include_router(downloads.build_router(require_auth))
 # Offline playback of finished downloads: /api/local/*, /local/* (logic in local_media.py)
 app.include_router(local_media.build_router(require_auth))
+# Watch a download while it is still running: /play/partial/*, /partial/* (partial_play.py)
+app.include_router(partial_play.build_router(require_auth))
 
 
 # =============================================================================
@@ -468,6 +512,8 @@ async def setup_create_user(
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request, error: str | None = None):
+    if AUTO_LOGIN_USER:
+        return RedirectResponse("/", status_code=303)
     """Login page - redirects to setup if no users exist."""
     if auth.is_setup_required():
         return RedirectResponse("/setup", status_code=303)
@@ -1029,6 +1075,7 @@ async def vod_page(
     category: int | None = None,
     sort: str | None = None,
     lang: str = "",
+    offset: int = 0,
 ):
     lang = _clean_lang(lang)
     # Load from file cache if not in memory (async to avoid blocking)
@@ -1104,10 +1151,19 @@ async def vod_page(
     elif sort == "newest":
         streams.sort(key=lambda s: int(s.get("added") or 0), reverse=True)
 
+    total = len(streams)
+    streams, next_url = _page_slice(streams, offset, request)
+    if offset > 0:
+        return TEMPLATES.TemplateResponse(
+            request, "_vod_cards.html", {"streams": streams, "next_url": next_url}
+        )
+
     return TEMPLATES.TemplateResponse(
         request,
         "vod.html",
         {
+            "total": total,
+            "next_url": next_url,
             "categories": categories,
             "streams": streams,
             "current_category": category,
@@ -1182,6 +1238,7 @@ async def series_page(
     category: int | None = None,
     sort: str | None = None,
     lang: str = "",
+    offset: int = 0,
 ):
     lang = _clean_lang(lang)
     # Load from file cache if not in memory (async to avoid blocking)
@@ -1257,10 +1314,19 @@ async def series_page(
     elif sort == "newest":
         series.sort(key=lambda s: int(s.get("last_modified") or 0), reverse=True)
 
+    total = len(series)
+    series, next_url = _page_slice(series, offset, request)
+    if offset > 0:
+        return TEMPLATES.TemplateResponse(
+            request, "_series_cards.html", {"series": series, "next_url": next_url}
+        )
+
     return TEMPLATES.TemplateResponse(
         request,
         "series.html",
         {
+            "total": total,
+            "next_url": next_url,
             "categories": categories,
             "series": series,
             "current_category": category,
@@ -1940,6 +2006,7 @@ async def search_page(
     lang: str = "",
 ):
     results: dict[str, list] = {"live": [], "vod": [], "series": []}
+    limit = limit if 0 < limit <= 500 else 100  # never render an unbounded result list
     lang = _clean_lang(lang)
     lang_counts: dict[str, int] = {}
     lang_matched: list[dict] = []
@@ -3446,7 +3513,7 @@ if __name__ == "__main__":
     uv_log = "debug" if args.debug else "info"
     uvicorn.run(
         app,
-        host="0.0.0.0",
+        host=os.environ.get("NETV_HOST", "0.0.0.0"),
         port=args.port,
         access_log=args.debug,
         log_level=uv_log,

@@ -43,6 +43,8 @@
   function actionsFor(d) {
     const a = [];
     if (d.status === 'done') a.push(['play', 'Lire']);
+    // Enough data to start watching while the rest downloads
+    else if (['downloading', 'queued', 'paused'].includes(d.status) && d.bytes_done > 30 * 1024 * 1024) a.push(['watch', 'Regarder maintenant']);
     if (d.status === 'downloading' || d.status === 'queued') a.push(['pause', 'Pause']);
     if (d.status === 'paused') a.push(['resume', 'Reprendre']);
     if (d.status === 'error') a.push(['resume', 'Réessayer']);
@@ -57,7 +59,8 @@
     r.title.title = d.filename || '';
     if (d.poster) { r.img.src = d.poster; r.img.hidden = false; }
     const pct = d.status === 'done' ? 100 : U.percent(d);
-    r.status.textContent = U.statusLabel(d.status) + (pct != null && d.status !== 'done' ? ' ' + pct + '%' : '');
+    r.status.textContent = U.statusLabel(d.status) + (pct != null && d.status !== 'done' ? ' ' + pct + '%' : '') +
+      (d.processing ? ' · préparation de l’audio…' : '');
     r.bar.setAttribute('aria-valuenow', pct == null ? '' : String(pct));
     r.fill.style.width = (pct == null ? (d.status === 'downloading' ? 8 : 0) : pct) + '%';
     r.fill.className = 'h-full transition-all ' + (d.status === 'done' ? 'bg-green-500' :
@@ -81,7 +84,7 @@
       row.sig = sig;
       r.actions.innerHTML = acts.map(([k, label]) =>
         '<button type="button" data-act="' + k + '" class="' + BTN + (k === 'delete' || k === 'cancel' ? ' hover:bg-red-700' : '') +
-        (k === 'play' ? ' bg-blue-600 hover:bg-blue-700' : '') + '" tabindex="0">' + label + '</button>').join('');
+        (k === 'play' || k === 'watch' ? ' bg-blue-600 hover:bg-blue-700' : '') + '" tabindex="0">' + label + '</button>').join('');
     }
   }
 
@@ -89,6 +92,10 @@
     const enc = encodeURIComponent(id);
     if (kind === 'play') {
       location.href = await window.NetvDL.playUrl(id);
+      return;
+    }
+    if (kind === 'watch') {
+      location.href = '/play/partial/' + enc;
       return;
     }
     if (kind === 'delete') {
@@ -151,7 +158,7 @@
     errBox.classList.toggle('hidden', !!data);
     if (data) {
       renderAll(data);
-      const active = (data.downloads || []).some(d => U.isActive(d.status));
+      const active = (data.downloads || []).some(d => U.isActive(d.status) || d.processing);
       timer = setTimeout(load, active ? 2000 : 8000);
     } else {
       timer = setTimeout(load, 8000);

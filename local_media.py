@@ -174,6 +174,18 @@ def _container_kind(format_name: str, ext: str) -> str:
     return next(iter(names), "") or ext
 
 
+_GENERIC_HANDLER = re.compile(r"handler|core media|isom|mp4|mov_text|text media", re.I)
+
+
+def _track_title(tags: dict[str, Any]) -> str:
+    """Track title; MP4 keeps it in ``handler_name`` (muxers write 'SubtitleHandler' by default)."""
+    title = str(tags.get("title", ""))
+    if title:
+        return title
+    handler = str(tags.get("handler_name", ""))
+    return "" if _GENERIC_HANDLER.search(handler) else handler
+
+
 def parse_probe(data: dict[str, Any], ext: str = "", size: int = 0) -> MediaInfo:
     """Turn ``ffprobe -show_format -show_streams`` JSON into a MediaInfo."""
     fmt = data.get("format") or {}
@@ -224,7 +236,7 @@ def parse_probe(data: dict[str, Any], ext: str = "", size: int = 0) -> MediaInfo
                     ordinal=len(subs),
                     codec=str(s.get("codec_name", "")),
                     lang=str(tags.get("language", "")),
-                    title=str(tags.get("title", "")),
+                    title=_track_title(tags),
                     default=bool(disp.get("default")),
                     forced=bool(disp.get("forced")),
                 )
@@ -1159,7 +1171,15 @@ def build_router(require_auth: Callable[..., Any]) -> APIRouter:
         except _FAILURES as exc:
             log.warning("local media probe failed for %s: %s", download_id, exc)
             raise HTTPException(500, "Could not analyse the file") from exc
-        return build_plan(download_id, info, duration)
+        plan = build_plan(download_id, info, duration)
+        entry = downloads.get_manager().get(download_id)
+        if entry is not None and len(entry.source_audio) > 1:
+            plan["source_audio"] = {
+                "tracks": entry.source_audio,
+                "kept": entry.audio_kept,
+                "size": entry.src_bytes,
+            }
+        return plan
 
     @router.get("/local/{download_id}/{variant}/master.m3u8", dependencies=auth)
     async def local_master(download_id: str, variant: str):

@@ -1045,8 +1045,19 @@
     hls.on(Hls.Events.MANIFEST_PARSED, apply);
   }
 
+  // Finished downloads keep ONE audio track in the file; the other tracks of the provider
+  // file are only listed (choosing one replaces the download, see changeLocalAudio).
+  let localSourceAudio = null;
+
   // Audio tracks from hls.js, or from the native API (Safari) as a fallback.
   function getAudioTracks() {
+    if (localSourceAudio) {
+      return localSourceAudio.tracks.map((t) => ({
+        idx: t.idx, lang: t.lang, name: t.title, active: t.idx === localSourceAudio.kept,
+        original: false,
+        label: Tracks.trackLabel(t.lang, t.title, `Piste ${t.idx + 1}`),
+      }));
+    }
     if (currentHls && currentHls.audioTracks && currentHls.audioTracks.length > 0) {
       const active = currentHls.audioTrack;
       return currentHls.audioTracks.map((t, i) => ({
@@ -1098,10 +1109,38 @@
     if (tracks.length > 1 && idx >= 0 && !tracks[idx].active) selectAudio(idx, false);
   }
 
+  async function changeLocalAudio(track) {
+    const src = localSourceAudio;
+    if (!src || track.idx === src.kept) return;
+    const fmt = window.NetvDLUtils && window.NetvDLUtils.formatBytes;
+    const size = src.size && fmt ? ' (' + fmt(src.size) + ')' : '';
+    const ok = window.confirm(
+      'Ce film est enregistré avec une seule piste audio.\n\n' +
+      'Passer sur « ' + track.label + ' » supprime la version actuelle et retélécharge ' +
+      'le film en entier' + size + '. Continuer ?');
+    if (!ok) return;
+    try {
+      const resp = await fetch('/api/downloads/' + encodeURIComponent(cfg.localDownloadId) + '/audio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ track: track.idx }),
+      });
+      if (!resp.ok) throw new Error('audio ' + resp.status);
+      window.location.href = '/downloads';
+    } catch (e) {
+      console.error('[LOCAL] audio change failed:', e);
+      window.alert('Impossible de relancer le téléchargement avec cette piste audio.');
+    }
+  }
+
   function selectAudio(idx, persist = true) {
     const tracks = getAudioTracks();
     const track = tracks[idx];
     if (!track) return;
+    if (localSourceAudio) {
+      if (persist) changeLocalAudio(track);  // never from automatic language restoring
+      return;
+    }
     if (currentHls && currentHls.audioTracks && currentHls.audioTracks.length > 0) {
       currentHls.audioTrack = idx;
     } else if (video.audioTracks) {
@@ -2019,6 +2058,10 @@
     }
     document.getElementById('progress-container')?.classList.remove('hidden');
     setupLocalSubtitles(plan);
+    if (plan.source_audio && plan.source_audio.tracks && plan.source_audio.tracks.length > 1) {
+      localSourceAudio = plan.source_audio;
+      updateAudioButton();
+    }
     localModes = Local.chooseModes(plan, Local.detectCaps(video, window));
     localModeIdx = 0;
     if (localModes.length === 0) {

@@ -53,6 +53,9 @@
     });
   };
 
+  // "Charger plus" (htmx) appends cards: refresh their favorite stars.
+  document.body.addEventListener('htmx:afterSwap', function() { window.updateFavoriteButtons(); });
+
   // Browse view handlers
   if (cfg.isBrowseView) {
     window.updateBrowseUrl = function() {

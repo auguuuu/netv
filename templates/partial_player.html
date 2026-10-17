@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <link rel="icon" href="/favicon.ico">
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+  <script src="/static/js/player-tracks.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #e5e7eb; font: 14px system-ui, sans-serif; }
+    body { display: flex; flex-direction: column; }
+    header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 8px 16px; background: #111827; }
+    header a { color: #93c5fd; text-decoration: none; }
+    header h1 { font-size: 15px; font-weight: 600; margin: 0; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    select { background: #1f2937; color: inherit; border: 1px solid #374151; border-radius: 4px; padding: 4px 6px; max-width: 45vw; }
+    #status { width: 100%; font-size: 12px; color: #9ca3af; }
+    #bar { width: 100%; height: 4px; background: #374151; border-radius: 2px; overflow: hidden; }
+    #fill { height: 100%; width: 0; background: #3b82f6; transition: width .5s; }
+    video { flex: 1; min-height: 0; width: 100%; background: #000; }
+    video::cue { font-size: 1.1em; }
+  </style>
+</head>
+<body>
+  <header>
+    <a href="/downloads">← Téléchargements</a>
+    <h1>{{ title }}</h1>
+    {% if audio_tracks | length > 1 %}
+    <label>Audio <select id="audio"></select></label>
+    {% endif %}
+    {% if subs %}
+    <label>Sous-titres <select id="subs"></select></label>
+    {% endif %}
+    <div id="status">Préparation…</div>
+    <div id="bar"><div id="fill"></div></div>
+  </header>
+  <video id="v" controls autoplay playsinline></video>
+<script>
+(function() {
+  'use strict';
+  const cfg = {{ {"id": id, "duration": duration, "audio": audio, "audioTracks": audio_tracks, "subs": subs} | tojson }};
+  const base = '/partial/' + encodeURIComponent(cfg.id) + '/';
+  const video = document.getElementById('v');
+  const statusEl = document.getElementById('status');
+  const fill = document.getElementById('fill');
+  const T = window.NetvTracks;
+  const label = (t, i) => (T ? T.trackLabel(t.lang, t.title, 'Piste ' + (i + 1)) : (t.lang || 'Piste ' + (i + 1)));
+  const posKey = 'netv-partial-pos-' + cfg.id;
+  const subKey = 'netv-partial-sub';
+
+  function fmt(sec) {
+    sec = Math.max(0, Math.floor(sec || 0));
+    const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+    return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(s).padStart(2, '0');
+  }
+
+  // ---------- Video ----------
+  const startAt = parseFloat(localStorage.getItem(posKey) || '0') || 0;
+  if (window.Hls && Hls.isSupported()) {
+    const hls = new Hls({ startPosition: startAt, maxBufferLength: 60, liveDurationInfinity: false });
+    hls.on(Hls.Events.ERROR, (_e, data) => {
+      if (!data.fatal) return;
+      if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+      else setTimeout(() => hls.startLoad(), 2000);
+    });
+    hls.loadSource(base + 'stream.m3u8');
+    hls.attachMedia(video);
+  } else {
+    video.src = base + 'stream.m3u8';
+    video.addEventListener('loadedmetadata', () => { if (startAt) video.currentTime = startAt; }, { once: true });
+  }
+  video.addEventListener('timeupdate', () => {
+    if (video.currentTime > 5) localStorage.setItem(posKey, String(Math.floor(video.currentTime)));
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'SELECT') return;
+    if (e.key === ' ') { e.preventDefault(); video.paused ? video.play() : video.pause(); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); video.currentTime -= 5; }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); video.currentTime += 5; }
+    else if (e.key === 'f') { document.fullscreenElement ? document.exitFullscreen() : video.requestFullscreen(); }
+  });
+
+  // ---------- Audio (restarts the session with another track) ----------
+  const audioSel = document.getElementById('audio');
+  if (audioSel) {
+    cfg.audioTracks.forEach((t, i) => audioSel.add(new Option(label(t, i), String(t.idx), false, t.idx === cfg.audio)));
+    audioSel.addEventListener('change', () => { location.href = location.pathname + '?a=' + audioSel.value; });
+  }
+
+  // ---------- Subtitles (the .vtt files grow with the download) ----------
+  const subSel = document.getElementById('subs');
+  let track = null, subIdx = -1, cueCount = 0, subTimer = null;
+
+  function parseTime(s) {
+    const p = s.trim().split(':').map(parseFloat);
+    return p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p[0] * 60 + p[1];
+  }
+
+  async function loadCues() {
+    if (subIdx < 0 || !track) return;
+    const idx = subIdx;
+    let text = '';
+    try {
+      const r = await fetch(base + 'sub' + idx + '.vtt');
+      if (r.ok) text = await r.text();
+    } catch (e) { /* retry on the next tick */ }
+    if (idx !== subIdx) return;
+    const blocks = text.replace(/\r/g, '').split(/\n\n+/).filter(b => b.includes('-->'));
+    // the last block may still be half written: keep it for the next round
+    for (let i = cueCount; i < blocks.length - 1; i++) {
+      const lines = blocks[i].split('\n');
+      const at = lines.findIndex(l => l.includes('-->'));
+      const m = lines[at].split('-->');
+      try {
+        track.addCue(new VTTCue(parseTime(m[0]), parseTime(m[1].trim().split(' ')[0]), lines.slice(at + 1).join('\n')));
+      } catch (e) { /* malformed cue */ }
+    }
+    cueCount = Math.max(cueCount, blocks.length - 1);
+  }
+
+  function selectSub(idx) {
+    clearInterval(subTimer);
+    if (track) { track.mode = 'disabled'; track = null; }
+    subIdx = idx; cueCount = 0;
+    localStorage.setItem(subKey, idx < 0 ? '' : (cfg.subs[idx].lang || ''));
+    if (idx < 0) return;
+    track = video.addTextTrack('subtitles', label(cfg.subs[idx], idx), cfg.subs[idx].lang || '');
+    track.mode = 'showing';
+    loadCues();
+    setTimeout(loadCues, 4000);
+    subTimer = setInterval(loadCues, 15000);
+  }
+
+  if (subSel) {
+    subSel.add(new Option('Aucun', '-1'));
+    cfg.subs.forEach((s, i) => subSel.add(new Option(label(s, i), String(i))));
+    subSel.addEventListener('change', () => selectSub(parseInt(subSel.value, 10)));
+    const saved = localStorage.getItem(subKey);
+    const audioLang = (cfg.audioTracks.find(t => t.idx === cfg.audio) || {}).lang;
+    const want = saved !== null ? saved : (audioLang === 'fr' ? '' : 'fr');
+    const found = want ? cfg.subs.findIndex(s => s.lang === want && !/forc|sdh/i.test(s.title)) : -1;
+    if (found >= 0) { subSel.value = String(found); selectSub(found); }
+  }
+
+  // ---------- Download progress (also keeps the session alive) ----------
+  async function poll() {
+    try {
+      const r = await fetch('/api/partial/' + encodeURIComponent(cfg.id) + '/status');
+      if (r.status === 404) { statusEl.textContent = 'Session expirée, rechargement…'; location.reload(); return; }
+      const s = await r.json();
+      const pct = s.bytes_total ? Math.floor(100 * s.bytes_done / s.bytes_total) : null;
+      const total = s.duration ? ' sur ' + fmt(s.duration) : '';
+      if (s.failed) statusEl.textContent = 'La lecture de ce fichier a échoué. Il sera lisible une fois le téléchargement terminé.';
+      else if (s.ended) statusEl.textContent = 'Téléchargement terminé : film complet disponible (' + fmt(s.ready) + ').';
+      else statusEl.textContent = 'Lecture pendant le téléchargement' + (pct != null ? ' (' + pct + ' %)' : '') +
+        ' · disponible jusqu’à ' + fmt(s.ready) + total +
+        (s.status === 'paused' ? ' · téléchargement en pause' : s.status === 'error' ? ' · téléchargement en erreur' : '');
+      fill.style.width = (s.ended ? 100 : s.duration ? Math.min(100, 100 * s.ready / s.duration) : (pct || 0)) + '%';
+    } catch (e) { /* server restarting */ }
+  }
+  poll();
+  setTimeout(poll, 4000);
+  setInterval(poll, 20000);
+})();
+</script>
+</body>
+</html>

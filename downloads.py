@@ -35,6 +35,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 import asyncio
+import concurrent.futures
 import contextlib
 import errno
 import http.client
@@ -115,6 +116,14 @@ class Entry:
     poster: str | None = None
     series_id: int | None = None
     queued_at: float = field(default_factory=time.time)
+    # Audio handling (see remux.py): the provider file has many audio tracks, we keep one
+    src_ext: str = ""  # container extension at the provider (``ext`` becomes "mp4" after remux)
+    src_bytes: int = 0  # size of the provider file
+    audio_pref: int = -1  # audio track (ordinal) forced for this download, -1 = automatic rule
+    source_audio: list = field(default_factory=list)  # audio tracks of the provider file
+    audio_kept: int = -1  # ordinal in ``source_audio`` of the track in the file
+    audio_reason: str = ""
+    processing: bool = False  # remux running (the original file stays playable meanwhile)
 
 
 class _Stopped(Exception):
@@ -338,6 +347,7 @@ class DownloadManager:
         timeout: float = 30.0,
         tick_interval: float = 2.0,
         slow_watch: Callable[[], SlowWatch] = SlowWatch,
+        optimizer: Callable[[Entry, pathlib.Path, pathlib.Path], Any] | None = None,
     ) -> None:
         """``source_limits(source_id)`` returns (max_streams, active_playback_sessions)."""
         self.dir = pathlib.Path(directory).expanduser()
@@ -352,6 +362,10 @@ class DownloadManager:
         self.timeout = timeout
         self.tick_interval = tick_interval
         self._slow_watch = slow_watch
+        # optimizer(entry, src, dst) writes dst (single audio MP4) and returns a remux.Plan;
+        # None disables the post-download step
+        self.optimizer = optimizer
+        self._post = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dl-opt")
         self._watches: dict[str, SlowWatch] = {}
         self._fractions: dict[str, float] = {}  # provider host -> learned fast fraction
         self._lock = threading.RLock()
@@ -420,6 +434,7 @@ class DownloadManager:
             except (TypeError, ValueError):
                 log.warning("Dropping invalid download index entry")
                 continue
+            entry.processing = False  # a remux interrupted by a restart is simply redone on demand
             if entry.status in ("queued", "downloading"):
                 entry.status = "paused"
             if entry.status == "done":
@@ -435,6 +450,8 @@ class DownloadManager:
                 except OSError:
                     entry.bytes_done = 0
             self._entries[entry.id] = entry
+        for stale in self.dir.glob("*.remux"):  # half written output of an interrupted remux
+            self._unlink(stale)
         self._save()
 
     def _save(self) -> None:
@@ -475,6 +492,7 @@ class DownloadManager:
                 if entry and entry.status == "downloading":
                     entry.status = "paused"
             self._save()
+        self._post.shutdown(wait=False, cancel_futures=True)
 
     def add(
         self,
@@ -486,6 +504,7 @@ class DownloadManager:
         ext: str = "mkv",
         poster: str | None = None,
         series_id: int | None = None,
+        audio_pref: int = -1,
     ) -> Entry:
         """Queue a download, or return the existing queued/downloading/paused/done one."""
         item_id = str(item_id)
@@ -515,6 +534,8 @@ class DownloadManager:
                 ext=ext,
                 poster=poster,
                 series_id=series_id,
+                src_ext=ext,
+                audio_pref=audio_pref,
             )
             self._entries[entry.id] = entry
             self._save()
@@ -629,6 +650,83 @@ class DownloadManager:
             return False
         return p.is_file() and p.parent == self.dir and not p.name.startswith(".")
 
+    # ------------------------------------------------------- audio / remux
+
+    def optimize(self, download_id: str) -> bool:
+        """Queue the remux of a finished download (single audio MP4). False if not applicable."""
+        e = self._entries.get(download_id)
+        if self.optimizer is None or e is None or e.status != "done" or e.processing:
+            return False
+        if e.ext == "mp4" and e.audio_kept >= 0:
+            return False  # already done
+        e.processing = True
+        self._save()
+        try:
+            self._post.submit(self._optimize, e.id)
+        except RuntimeError:  # shutting down
+            e.processing = False
+            return False
+        return True
+
+    def _optimize(self, download_id: str) -> None:
+        e = self._entries.get(download_id)
+        if e is None or self.optimizer is None:
+            return
+        try:
+            src = self.safe_path(e.filename)
+            stem = src.name[: -len(src.suffix)] if src.suffix else src.name
+            dst = self.safe_path(self._unique_filename(stem, "mp4"))
+            plan = self.optimizer(e, src, dst)
+        except Exception as exc:  # the original file is untouched, playback works as before
+            log.info("Download %s: audio optimisation skipped (%s)", e.filename, exc)
+            with self._lock:
+                e.processing = False
+                self._save()
+            return
+        with self._lock:
+            if e.id not in self._entries or e.status != "done":
+                self._unlink(dst)  # deleted while we worked
+                return
+            old = e.filename
+            e.src_bytes = e.src_bytes or src.stat().st_size
+            e.src_ext = e.src_ext or e.ext
+            e.filename = dst.name
+            e.ext = "mp4"
+            e.source_audio = plan.audio
+            e.audio_kept = plan.kept
+            e.audio_reason = plan.reason
+            e.bytes_done = e.bytes_total = dst.stat().st_size
+            e.processing = False
+            self._save()
+        with contextlib.suppress(ValueError):
+            self._unlink(self.safe_path(old))
+        log.info(
+            "Download %s: kept audio %s (%s), %.1f GB -> %.1f GB",
+            dst.name, plan.audio[plan.kept].get("lang"), plan.reason,
+            e.src_bytes / 1e9, e.bytes_done / 1e9,
+        )  # fmt: skip
+
+    def redownload_with_audio(self, download_id: str, track: int) -> Entry:
+        """Delete a finished download and fetch the provider file again keeping audio ``track``."""
+        e = self._require(download_id)
+        if e.status != "done" or not e.source_audio:
+            raise HTTPException(409, "This download has no alternative audio track")
+        if not 0 <= track < len(e.source_audio):
+            raise HTTPException(400, "No such audio track")
+        if track == e.audio_kept:
+            raise HTTPException(409, "This audio track is already the one in the file")
+        if e.processing:
+            raise HTTPException(409, "The file is still being prepared")
+        kind, item_id, source_id = e.kind, e.item_id, e.source_id
+        title, poster, series_id = e.title, e.poster, e.series_id
+        ext = e.src_ext or "mkv"
+        with self._lock:
+            self._remove(e)
+            return self.add(
+                kind, item_id, source_id=source_id, title=title, ext=ext,
+                poster=poster, series_id=series_id, audio_pref=track,
+            )  # fmt: skip
+
     # -------------------------------------------------------------- internals
 
     def _require(self, download_id: str) -> Entry:
@@ -685,6 +783,8 @@ class DownloadManager:
             "created_at": e.created_at,
             "finished_at": e.finished_at,
             "poster": e.poster,
+            "processing": e.processing,
+            "audio_kept": e.audio_kept,
         }
 
     def schedule(self) -> None:
@@ -738,6 +838,8 @@ class DownloadManager:
     def _worker(self, e: Entry, ctl: _Ctl) -> None:
         try:
             self._download(e, ctl)
+            if e.status == "done":
+                self.optimize(e.id)
         except _Stopped:
             pass
         except _Fatal as exc:
@@ -901,6 +1003,7 @@ class DownloadManager:
             os.replace(part, self.safe_path(e.filename))
             e.status = "done"
             e.bytes_done = e.bytes_total = done
+            e.src_bytes = done
             e.finished_at = time.time()
             e.error = None
             self._watches.pop(e.id, None)
@@ -930,7 +1033,7 @@ def build_provider_url(entry: Entry) -> str:
     if not client:
         raise _Fatal("Source is not configured any more")
     stream_type = "movie" if entry.kind == "movie" else "series"
-    return client.build_stream_url(stream_type, int(entry.item_id), entry.ext)
+    return client.build_stream_url(stream_type, int(entry.item_id), entry.src_ext or entry.ext)
 
 
 def describe_item(
@@ -1076,6 +1179,23 @@ _manager: DownloadManager | None = None
 _manager_lock = threading.Lock()
 
 
+# Set by main.py: (entry, provider file) -> ISO 639-1 original language or "" (may block)
+vo_resolver: Callable[[Entry, pathlib.Path], str] | None = None
+
+
+def default_optimizer(entry: Entry, src: pathlib.Path, dst: pathlib.Path) -> Any:
+    """Single audio MP4 of ``src`` (rule in remux.py)."""
+    import remux
+
+    vo = ""
+    if vo_resolver is not None:
+        try:
+            vo = vo_resolver(entry, src) or ""
+        except Exception:
+            log.debug("original language lookup failed", exc_info=True)
+    return remux.remux(src, dst, vo=vo, pref=entry.audio_pref)
+
+
 def get_manager() -> DownloadManager:
     global _manager
     with _manager_lock:
@@ -1087,6 +1207,7 @@ def get_manager() -> DownloadManager:
                 build_provider_url,
                 user_agent=get_user_agent,
                 source_limits=default_source_limits,
+                optimizer=None if os.environ.get("NETV_DOWNLOAD_REMUX") == "0" else default_optimizer,
             )
         return _manager
 
@@ -1117,6 +1238,10 @@ class DownloadRequest(BaseModel):
     ext: str = ""
     series_id: int | None = None
     poster: str | None = None
+
+
+class AudioChangeRequest(BaseModel):
+    track: int
 
 
 def build_router(
@@ -1194,6 +1319,19 @@ def build_router(
     async def cancel_download(download_id: str):
         mgr = get_manager()
         return {"download": mgr.public(mgr.cancel(download_id))}
+
+    @router.post("/api/downloads/{download_id}/audio", dependencies=auth)
+    async def change_audio(download_id: str, req: AudioChangeRequest):
+        """Another audio track means another file: the download is replaced and fetched again."""
+        mgr = get_manager()
+        entry = await asyncio.to_thread(mgr.redownload_with_audio, download_id, req.track)
+        return {"download": mgr.public(entry)}
+
+    @router.post("/api/downloads/{download_id}/optimize", dependencies=auth)
+    async def optimize_download(download_id: str):
+        mgr = get_manager()
+        mgr._require(download_id)
+        return {"queued": mgr.optimize(download_id)}
 
     @router.delete("/api/downloads/{download_id}", dependencies=auth)
     async def delete_download(download_id: str):
