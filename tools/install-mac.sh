@@ -1,5 +1,6 @@
 #!/bin/bash
-# Install neTV on a Mac as an always-on service (starts at login, restarts if it crashes).
+# Install neTV on a Mac as an always-on service (starts at login, restarts if it crashes)
+# that updates itself from GitHub every 30 minutes (tools/update.sh).
 #
 # Usage (from the project folder):
 #   ./tools/install-mac.sh [--settings netv-settings.tar.gz] [--port 8765]
@@ -40,7 +41,7 @@ if ! command -v brew >/dev/null 2>&1; then
         [ -x "$b" ] && eval "$("$b" shellenv)" && break
     done
 fi
-for pkg in ffmpeg uv; do
+for pkg in ffmpeg uv gh; do
     command -v "$pkg" >/dev/null 2>&1 || { echo "==> brew install $pkg"; brew install "$pkg"; }
 done
 BREW_BIN="$(dirname "$(command -v ffmpeg)")"
@@ -86,7 +87,31 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 sleep 2
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 
-# 5. Check
+# 5. Automatic updates from GitHub every 30 minutes (tools/update.sh)
+UPDATE_PLIST="$HOME/Library/LaunchAgents/$LABEL.update.plist"
+if gh auth status >/dev/null 2>&1; then gh auth setup-git >/dev/null 2>&1 || true; fi
+cat > "$UPDATE_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$LABEL.update</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/bash</string><string>$APP_DIR/tools/update.sh</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>$BREW_BIN:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>NETV_PORT</key><string>$PORT</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>1800</integer>
+  <key>StandardOutPath</key><string>$LOG_DIR/update.log</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/update.log</string>
+</dict></plist>
+EOF
+launchctl bootout "gui/$(id -u)/$LABEL.update" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$UPDATE_PLIST"
+
+# 6. Check
 for _ in $(seq 1 30); do
     if curl -s -o /dev/null "http://localhost:$PORT/"; then
         echo "==> neTV is running: http://localhost:$PORT"
