@@ -299,7 +299,7 @@ class TestSetup:
             data={"username": "ab", "password": "password123", "confirm": "password123"},
         )
         assert resp.status_code == 200
-        assert b"at least 3" in resp.content
+        assert "au moins 3" in resp.text
 
     def test_setup_validates_password_length(self, client):
         resp = client.post(
@@ -307,7 +307,7 @@ class TestSetup:
             data={"username": "admin", "password": "short", "confirm": "short"},
         )
         assert resp.status_code == 200
-        assert b"at least 8" in resp.content
+        assert "au moins 8" in resp.text
 
     def test_setup_validates_password_match(self, client):
         resp = client.post(
@@ -315,7 +315,7 @@ class TestSetup:
             data={"username": "admin", "password": "password123", "confirm": "different"},
         )
         assert resp.status_code == 200
-        assert b"do not match" in resp.content
+        assert "ne correspondent pas" in resp.text
 
 
 class TestLogin:
@@ -456,7 +456,7 @@ class TestGuide:
             resp = auth_client.get("/guide")
             assert resp.status_code == 200
             # Should show loading state
-            assert b"loading" in resp.content.lower() or b"Loading" in resp.content
+            assert "chargement" in resp.text.lower()
 
     def test_guide_shows_channels_from_cache(self, auth_client):
         cache_module.get_cache()["live_categories"] = [

@@ -1,13 +1,13 @@
 {% extends "base.html" %}
-{% block title %}Search - neTV{% endblock %}
+{% block title %}Rechercher - neTV{% endblock %}
 
 {% block content %}
 <div class="flex flex-col h-full min-h-0 min-w-0">
-  <h2 class="text-xl sm:text-3xl font-bold mb-6">Search</h2>
+  <h2 class="text-xl sm:text-3xl font-bold mb-6">Rechercher</h2>
 
   <form action="/search" method="GET" class="mb-8">
     <div class="flex flex-wrap items-center gap-2 sm:gap-4 max-w-xl mb-3">
-      <input type="text" name="q" value="{{ query }}" placeholder="Search..."
+      <input type="text" name="q" value="{{ query }}" placeholder="Rechercher…"
              class="flex-1 min-w-0 px-3 sm:px-6 py-2 sm:py-4 bg-gray-800 rounded-lg text-base sm:text-xl focus:ring-2 focus:ring-blue-500 focus:outline-none"
              autofocus>
       <label class="flex items-center gap-2 text-sm text-gray-400 cursor-pointer">
@@ -20,21 +20,21 @@
       <label class="flex items-center gap-2 text-gray-400 cursor-pointer">
         <input type="checkbox" name="live" value="true" {% if search_live %}checked{% endif %}
                class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
-        Live TV
+        TV en direct
       </label>
       <label class="flex items-center gap-2 text-gray-400 cursor-pointer">
         <input type="checkbox" name="vod" value="true" {% if search_vod %}checked{% endif %}
                class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
-        Movies
+        Films
       </label>
       <label class="flex items-center gap-2 text-gray-400 cursor-pointer">
         <input type="checkbox" name="series" value="true" {% if search_series %}checked{% endif %}
                class="w-4 h-4 rounded bg-gray-700 border-gray-600 text-blue-500 focus:ring-blue-500">
-        Series
+        Séries
       </label>
       {% include "_lang_select.html" %}
       <label class="flex items-center gap-2 text-gray-400">
-        <span>Limit:</span>
+        <span>Limite :</span>
         <select name="limit" class="bg-gray-700 border-gray-600 rounded px-2 py-1 text-sm" onchange="this.form.submit()">
           <option value="25" {% if limit == 25 %}selected{% endif %}>25</option>
           <option value="50" {% if limit == 50 %}selected{% endif %}>50</option>
@@ -49,15 +49,15 @@
   {% if query %}
   {% if results.live or results.vod or results.series %}
   <div class="flex gap-4 mb-4 text-sm">
-    {% if results.live %}<a href="#live-results" class="text-blue-400 hover:underline">Live ({{ results.live|length }}{% if limit and results.live|length == limit %}+{% endif %})</a>{% endif %}
-    {% if results.vod %}<a href="#vod-results" class="text-blue-400 hover:underline">Movies ({{ results.vod|length }}{% if limit and results.vod|length == limit %}+{% endif %})</a>{% endif %}
-    {% if results.series %}<a href="#series-results" class="text-blue-400 hover:underline">Series ({{ results.series|length }}{% if limit and results.series|length == limit %}+{% endif %})</a>{% endif %}
+    {% if results.live %}<a href="#live-results" class="text-blue-400 hover:underline">Direct ({{ results.live|length }}{% if limit and results.live|length == limit %}+{% endif %})</a>{% endif %}
+    {% if results.vod %}<a href="#vod-results" class="text-blue-400 hover:underline">Films ({{ results.vod|length }}{% if limit and results.vod|length == limit %}+{% endif %})</a>{% endif %}
+    {% if results.series %}<a href="#series-results" class="text-blue-400 hover:underline">Séries ({{ results.series|length }}{% if limit and results.series|length == limit %}+{% endif %})</a>{% endif %}
   </div>
   {% endif %}
   <!-- Live results -->
   {% if results.live %}
   <div id="live-results" class="mb-8">
-    <h3 class="text-2xl font-semibold mb-4">Live Channels ({{ results.live|length }}{% if limit and results.live|length == limit %}+{% endif %})</h3>
+    <h3 class="text-2xl font-semibold mb-4">Chaînes en direct ({{ results.live|length }}{% if limit and results.live|length == limit %}+{% endif %})</h3>
     <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
       {% for stream in results.live %}
       <a href="/play/live/{{ stream.stream_id }}"
@@ -77,7 +77,7 @@
   <!-- VOD results -->
   {% if results.vod %}
   <div id="vod-results" class="mb-8">
-    <h3 class="text-2xl font-semibold mb-4">Movies ({{ results.vod|length }}{% if limit and results.vod|length == limit %}+{% endif %})</h3>
+    <h3 class="text-2xl font-semibold mb-4">Films ({{ results.vod|length }}{% if limit and results.vod|length == limit %}+{% endif %})</h3>
     <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
       {% for movie in results.vod %}
       <div class="movie-card relative group" data-movie-id="{{ movie.stream_id }}" data-movie-name="{{ movie.name }}"
@@ -108,7 +108,7 @@
   <!-- Series results -->
   {% if results.series %}
   <div id="series-results" class="mb-8">
-    <h3 class="text-2xl font-semibold mb-4">Series ({{ results.series|length }}{% if limit and results.series|length == limit %}+{% endif %})</h3>
+    <h3 class="text-2xl font-semibold mb-4">Séries ({{ results.series|length }}{% if limit and results.series|length == limit %}+{% endif %})</h3>
     <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3">
       {% for s in results.series %}
       <div class="series-card relative group" data-series-id="{{ s.series_id }}" data-series-name="{{ s.name }}" data-series-cover="{{ (s.cover or '') | logo_url }}">
@@ -136,7 +136,7 @@
   {% endif %}
 
   {% if not results.live and not results.vod and not results.series %}
-  <p class="text-gray-400 text-xl">No results found for "{{ query }}"</p>
+  <p class="text-gray-400 text-xl">Aucun résultat pour « {{ query }} »</p>
   {% endif %}
   {% endif %}
   </div>
