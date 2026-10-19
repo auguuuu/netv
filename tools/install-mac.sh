@@ -79,6 +79,9 @@ cat > "$PLIST" <<EOF
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
+  <!-- playback first: ahead of background jobs when the Mac is busy -->
+  <key>ProcessType</key><string>Interactive</string>
+  <key>Nice</key><integer>-10</integer>
   <key>StandardOutPath</key><string>$LOG_DIR/netv.log</string>
   <key>StandardErrorPath</key><string>$LOG_DIR/netv.log</string>
 </dict></plist>
