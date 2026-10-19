@@ -1182,6 +1182,7 @@
     const filtered = () => Array.from(video.textTracks).filter(t => t.kind === 'subtitles' || t.kind === 'captions');
     if (activeTrackStates?.length > 0) {
       activeTrackStates.forEach((ts, i) => ts.track.mode = i === idx ? 'showing' : 'hidden');
+      if (cfg.localDownloadId) silenceForeignTracks();
     } else {
       if (currentHls?.subtitleTracks?.length > 0) {
         currentHls.subtitleDisplay = ccEnabled;
@@ -1947,6 +1948,12 @@
 
   // Text subtitles are complete WebVTT files (not part of the HLS), loaded the first time
   // a track is shown, so the CC menu works the same for the raw file and for HLS.
+  function silenceForeignTracks() {
+    if (!activeTrackStates) return;
+    const ours = new Set((activeTrackStates || []).map((ts) => ts.track));
+    Array.from(video.textTracks).forEach((t) => { if (!ours.has(t)) t.mode = 'disabled'; });
+  }
+
   function setupLocalSubtitles(plan) {
     const entries = Local.subtitleEntries(plan);
     if (entries.length === 0) {
@@ -1961,6 +1968,10 @@
       loaded: false,
     }));
     activeTrackStates.forEach((ts) => { ts.track.mode = 'hidden'; });
+    // The file's own subtitle tracks (MP4 mov_text, exposed by Safari) would be drawn on top
+    // of ours and ignore the CC menu: keep them disabled, including those added later.
+    silenceForeignTracks();
+    video.textTracks.addEventListener('addtrack', silenceForeignTracks);
     enableCcButton();
     const load = async (ts) => {
       if (ts.loaded) return;
