@@ -409,6 +409,10 @@ def cleanup_and_recover_sessions() -> None:
                     height=p.get("height", 0),
                     video_bitrate=p.get("video_bitrate", 0),
                     interlaced=p.get("interlaced", False),
+                    # keep the alternate audio tracks, else the next play has a single track
+                    audio_streams=[
+                        audio_stream_from_dict(a) for a in info.get("audio_tracks") or []
+                    ],
                 )
                 subs = [
                     SubtitleStream(s["index"], s.get("lang", "und"), s.get("name", ""))
