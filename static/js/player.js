@@ -1686,13 +1686,13 @@
   // ============================================================
 
   function setupCast() {
-    if (!cfg.isHttps) return;
+    if (!cfg.isHttps && !window.isSecureContext) return;  // the Cast SDK needs https or localhost
     const castBtn = document.getElementById('cast-btn');
     if (!castBtn) return;
 
     function getCastUrl() {
       const host = cfg.castHost || window.location.host;
-      const proto = window.location.protocol;
+      const proto = cfg.castHost ? 'http:' : window.location.protocol;
       if (transcodeSessionId) {
         const path = transcodePlaylist || '/transcode/' + transcodeSessionId + '/stream.m3u8';
         return proto + '//' + host + path;

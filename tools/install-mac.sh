@@ -74,7 +74,7 @@ cat > "$PLIST" <<EOF
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>$BREW_BIN:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>NETV_AUTO_LOGIN</key><string>admin</string>
-    <key>NETV_HOST</key><string>127.0.0.1</string>
+    <key>NETV_HOST</key><string>0.0.0.0</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

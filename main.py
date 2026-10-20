@@ -439,6 +439,57 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 # (only safe when the server is bound to localhost, see NETV_HOST).
 AUTO_LOGIN_USER = os.environ.get("NETV_AUTO_LOGIN", "")
 
+# Chromecast: the TV fetches the HLS stream itself, so the server listens on the LAN too.
+# Other machines only get the transcode files (unguessable session ids) and only from a
+# private network; the rest of the app (no password with NETV_AUTO_LOGIN) stays local.
+_CAST_PATH = re.compile(r"^/transcode/[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+$")
+
+
+def _is_local_client(host: str) -> bool:
+    import ipaddress
+
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host in ("localhost", "testclient")
+
+
+def _is_lan_client(host: str) -> bool:
+    import ipaddress
+
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return ip.is_private and not ip.is_loopback
+
+
+@app.middleware("http")
+async def lan_guard(request: Request, call_next):
+    host = request.client.host if request.client else ""
+    if _is_local_client(host):
+        return await call_next(request)
+    if _is_lan_client(host) and request.method in ("GET", "HEAD", "OPTIONS") and _CAST_PATH.match(request.url.path):
+        return await call_next(request)
+    return Response("Forbidden", status_code=403)
+
+
+def _lan_ip() -> str:
+    import socket
+
+    with contextlib.suppress(OSError), socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("192.168.0.1", 9))  # no packet is sent: picks the LAN interface
+        return s.getsockname()[0]
+    return ""
+
+
+def cast_host_for(request: Request, user_settings: dict) -> str:
+    """Address the Chromecast uses to reach this server (Mac's LAN IP unless set by hand)."""
+    if user_settings.get("cast_host"):
+        return user_settings["cast_host"]
+    ip = _lan_ip()
+    return f"{ip}:{request.url.port or 80}" if ip else ""
+
 
 def get_current_user(request: Request) -> dict | None:
     token = request.cookies.get("token")
@@ -1879,7 +1930,7 @@ async def player_download_page(
             "series_name": "",
             "cc_lang": user_settings.get("cc_lang", ""),
             "cc_style": user_settings.get("cc_style", {}),
-            "cast_host": user_settings.get("cast_host", ""),
+            "cast_host": cast_host_for(request, user_settings),
             "next_episode_url": None,
             "deinterlace_fallback": False,
             "source_id": "",
@@ -2002,7 +2053,7 @@ async def player_page(
             "series_name": series_name,
             "cc_lang": user_settings.get("cc_lang", ""),
             "cc_style": user_settings.get("cc_style", {}),
-            "cast_host": user_settings.get("cast_host", ""),
+            "cast_host": cast_host_for(request, user_settings),
             "next_episode_url": next_episode_url,
             "deinterlace_fallback": info.deinterlace_fallback,
             "source_id": info.source_id,
@@ -2649,7 +2700,7 @@ async def settings_page(request: Request, user: Annotated[dict, Depends(require_
             "selected_series_cats": user_settings.get("series_filter", []),
             "cc_lang": user_settings.get("cc_lang", ""),
             "cc_style": user_settings.get("cc_style", {}),
-            "cast_host": user_settings.get("cast_host", ""),
+            "cast_host": cast_host_for(request, user_settings),
             "content_access": _get_content_access(username),
         },
     )
