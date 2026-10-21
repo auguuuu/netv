@@ -3606,15 +3606,30 @@ if __name__ == "__main__":
         ssl_args = {"ssl_certfile": str(cert), "ssl_keyfile": str(key)}
 
     uv_log = "debug" if args.debug else "info"
-    uvicorn.run(
+    host = os.environ.get("NETV_HOST", "0.0.0.0")
+    config = uvicorn.Config(
         app,
-        host=os.environ.get("NETV_HOST", "0.0.0.0"),
+        host=host,
         port=args.port,
         access_log=args.debug,
         log_level=uv_log,
         log_config=None,  # preserve our basicConfig
         timeout_graceful_shutdown=5,
         proxy_headers=True,
-        forwarded_allow_ips="*",
+        # Only a proxy on this machine may set the client address: lan_guard trusts it
+        forwarded_allow_ips=os.environ.get("NETV_FORWARDED_ALLOW_IPS", "127.0.0.1"),
         **ssl_args,  # pyright: ignore[reportArgumentType]
     )
+    sockets = []
+    if host == "0.0.0.0":
+        # Also hold 127.0.0.1:port explicitly: otherwise another dev server can bind it and
+        # silently take over http://localhost:port (a more specific address wins).
+        import socket
+
+        for addr in ("0.0.0.0", "127.0.0.1"):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((addr, args.port))
+            sockets.append(sock)
+    uvicorn.Server(config).run(sockets=sockets or None)
+
