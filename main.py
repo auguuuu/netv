@@ -103,6 +103,7 @@ import line_status
 import local_media
 import original_lang
 import partial_play
+import title_search
 
 
 log = logging.getLogger()
@@ -2131,9 +2132,11 @@ async def search_page(
                     return False
         else:
             q_lower = q.lower()
+            q_fold = title_search.fold(q)
 
             def match_fn(name: str) -> bool:
-                return q_lower in name.lower()
+                # accents and punctuation ignored: "enigme" finds "Énigme"
+                return q_lower in name.lower() or (bool(q_fold) and q_fold in title_search.fold(name))
 
         # Load live data (run in thread to avoid blocking)
         if live:
@@ -2156,7 +2159,13 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["vod_categories"] = vod_cats
                     get_cache()["vod_streams"] = vod_streams
-            matched = [s for s in get_cache()["vod_streams"] if match_fn(s.get("name") or "")]
+            # also the entries named in another language (French title -> "Insurgent (2015)")
+            rel = await asyncio.to_thread(title_search.related, q, "movie") if not regex else None
+            matched = [
+                s
+                for s in get_cache()["vod_streams"]
+                if match_fn(s.get("name") or "") or (rel and title_search.matches(s, rel))
+            ]
             cat_names = catalog_lang.category_names(get_cache().get("vod_categories", []))
             lang_matched += matched
             lang_names.update(cat_names)
@@ -2173,7 +2182,12 @@ async def search_page(
                 with get_cache_lock():
                     get_cache()["series_categories"] = series_cats
                     get_cache()["series"] = series_list
-            matched = [s for s in get_cache()["series"] if match_fn(s.get("name") or "")]
+            rel = await asyncio.to_thread(title_search.related, q, "series") if not regex else None
+            matched = [
+                s
+                for s in get_cache()["series"]
+                if match_fn(s.get("name") or "") or (rel and title_search.matches(s, rel))
+            ]
             cat_names = catalog_lang.category_names(get_cache().get("series_categories", []))
             lang_matched += matched
             lang_names.update(cat_names)
