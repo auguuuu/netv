@@ -10,7 +10,7 @@
   if (!host) return;
   const sel = document.getElementById('lang-select');
   const kind = host.dataset.kind === 'series' ? 'series' : 'movies';
-  const browseUrl = kind === 'series' ? '/series?sort=rating' : '/vod?sort=rating';
+  const browseUrl = kind === 'series' ? '/series?sort=newest' : '/vod?sort=newest';
   const skeleton = host.innerHTML;
   const FIRST_ROWS = 4;  // rendered on load
   const MORE_ROWS = 4;   // added per "Afficher plus" click

@@ -25,7 +25,7 @@
         Favoris
       </a>
       {% else %}
-      <a href="/vod?sort=rating" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
+      <a href="/vod?sort=newest" class="px-4 py-2 rounded bg-gray-700 hover:bg-gray-600 focusable" tabindex="0">
         Tout parcourir
       </a>
       {% endif %}
@@ -76,7 +76,7 @@
       <span class="text-sm text-gray-400">Découvrir</span>
       <div class="flex items-center gap-2">
         {% include "_lang_select.html" %}
-        <a href="/vod?sort=rating" class="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 focusable text-sm" tabindex="0">Tout parcourir</a>
+        <a href="/vod?sort=newest" class="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 focusable text-sm" tabindex="0">Tout parcourir</a>
       </div>
     </div>
     <div id="discover-rows" data-kind="movies" aria-live="polite">
