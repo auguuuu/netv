@@ -70,6 +70,8 @@
       const langSel = document.getElementById('lang-select');
       // Explicit "lang=" (even empty) records a deliberate "Toutes" over the remembered choice.
       if (langSel) params.set('lang', langSel.value);
+      const genreSel = document.getElementById('genre-select');
+      if (genreSel && genreSel.value) params.set('genre', genreSel.value);
       window.location.href = cfg.baseUrl + '?' + params;
     };
 
@@ -77,6 +79,8 @@
     const sortSel = document.getElementById('sort-select');
     if (catSel) catSel.addEventListener('change', updateBrowseUrl);
     if (sortSel) sortSel.addEventListener('change', updateBrowseUrl);
+    const genreSel = document.getElementById('genre-select');
+    if (genreSel) genreSel.addEventListener('change', updateBrowseUrl);
     updateFavoriteButtons();
   }
 

@@ -51,6 +51,7 @@
         <option value="release" {% if current_sort == 'release' %}selected{% endif %}>Date de sortie</option>
       </select>
       {% include "_lang_select.html" %}
+      {% include "_genre_select.html" %}
       {% if current_platform %}
       <a href="{{ request.url.remove_query_params(['platform', 'offset']) }}"
          class="flex items-center gap-1 px-3 py-1 rounded-full bg-blue-700 hover:bg-blue-600 text-sm focusable" tabindex="0"

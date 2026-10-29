@@ -1,0 +1,12 @@
+{# Dropdown "Genre" (genres.py, from Wikidata). Expects genre_options and current_genre. #}
+{% if genre_options or current_genre %}
+<label class="flex items-center gap-2 text-sm text-gray-400" title="Genres issus de Wikidata : les films sans genre connu n'apparaissent pas quand un genre est choisi">
+  <span>Genre :</span>
+  <select id="genre-select" class="bg-gray-700 text-white border-gray-600 rounded px-2 py-1 text-sm">
+    <option value="">Tous</option>
+    {% for o in genre_options %}
+    <option value="{{ o.key }}" {% if current_genre == o.key %}selected{% endif %}>{{ o.label }} ({{ o.count }})</option>
+    {% endfor %}
+  </select>
+</label>
+{% endif %}

@@ -99,6 +99,7 @@ import downloads
 import epg
 import ffmpeg_command
 import ffmpeg_session
+import genres
 import line_status
 import local_media
 import original_lang
@@ -213,6 +214,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Clean up orphaned transcodes and preload data on startup."""
     # Initialize EPG database
     epg.init(CACHE_DIR)
+    genres.init(CACHE_DIR)
 
     # Prune expired EPG data (keep 24h buffer for "what was just on")
     cutoff = datetime.now(UTC) - timedelta(hours=24)
@@ -1154,8 +1156,10 @@ async def vod_page(
     lang: str = "",
     offset: int = 0,
     platform: str = "",
+    genre: str = "",
 ):
     lang = _clean_lang(lang)
+    genre = genre if genre in genres.LABELS else ""
     # Load from file cache if not in memory (async to avoid blocking)
     if "vod_categories" not in get_cache() or "vod_streams" not in get_cache():
         cached = await asyncio.to_thread(load_file_cache, "vod_data")
@@ -1222,6 +1226,11 @@ async def vod_page(
     lang_options = _lang_options(catalog_lang.option_counts(streams, lang_names), lang)
     streams = catalog_lang.filter_by_language(streams, lang, lang_names)
 
+    # Genre (Wikidata, refreshed weekly in the background; counts before the genre filter)
+    genres.refresh_in_background(get_cache()["vod_streams"], get_cache().get("series") or [])
+    genre_options = genres.options("movies", streams)
+    streams = genres.filter_items("movies", streams, genre)
+
     # Sort
     if sort == "alpha":
         streams.sort(key=lambda s: (s.get("name") or "").lower())
@@ -1250,6 +1259,8 @@ async def vod_page(
             "current_lang": lang,
             "current_platform": platform_group,
             "lang_options": lang_options,
+            "genre_options": genre_options,
+            "current_genre": genre,
             "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
             "content_access": _get_content_access(username),
         },
@@ -1331,8 +1342,10 @@ async def series_page(
     lang: str = "",
     offset: int = 0,
     platform: str = "",
+    genre: str = "",
 ):
     lang = _clean_lang(lang)
+    genre = genre if genre in genres.LABELS else ""
     # Load from file cache if not in memory (async to avoid blocking)
     if "series_categories" not in get_cache() or "series" not in get_cache():
         cached = await asyncio.to_thread(load_file_cache, "series_data")
@@ -1399,6 +1412,10 @@ async def series_page(
     lang_options = _lang_options(catalog_lang.option_counts(series, lang_names), lang)
     series = catalog_lang.filter_by_language(series, lang, lang_names)
 
+    genres.refresh_in_background(get_cache().get("vod_streams") or [], get_cache()["series"])
+    genre_options = genres.options("series", series)
+    series = genres.filter_items("series", series, genre)
+
     # Sort
     if sort == "alpha":
         series.sort(key=lambda s: (s.get("name") or "").lower())
@@ -1429,6 +1446,8 @@ async def series_page(
             "current_lang": lang,
             "current_platform": platform_group,
             "lang_options": lang_options,
+            "genre_options": genre_options,
+            "current_genre": genre,
             "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
             "content_access": _get_content_access(username),
         },
