@@ -2676,7 +2676,7 @@ async def settings_page(request: Request, user: Annotated[dict, Depends(require_
             "transcode_dir": server_settings.get("transcode_dir", ""),
             "probe_live": server_settings.get("probe_live", True),
             "probe_movies": server_settings.get("probe_movies", True),
-            "probe_series": server_settings.get("probe_series", False),
+            "probe_series": server_settings.get("probe_series", True),
             "user_agent_preset": server_settings.get("user_agent_preset", "default"),
             "user_agent_custom": server_settings.get("user_agent_custom", ""),
             "available_encoders": AVAILABLE_ENCODERS,

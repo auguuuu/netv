@@ -506,7 +506,14 @@ def load_server_settings() -> dict[str, Any]:
     data.setdefault("transcode_dir", "")  # Empty = system temp dir
     data.setdefault("probe_live", True)
     data.setdefault("probe_movies", True)
-    data.setdefault("probe_series", False)
+    data.setdefault("probe_series", True)
+    if not data.get("probe_series_on_v1"):
+        # Unprobed episodes have no known duration (the player stops at the first minute
+        # transcoded), no audio track menu and no subtitles: turn probing on once
+        data["probe_series"] = True
+        data["probe_series_on_v1"] = True
+        if SERVER_SETTINGS_FILE.exists():
+            save_server_settings(data)
     data.setdefault("sources", [])
     data.setdefault("users", {})
     data.setdefault("user_agent_preset", "tivimate")
