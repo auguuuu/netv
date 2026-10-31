@@ -2250,17 +2250,8 @@ async def search_page(
             if any(str(cat_id) in guide_filter_set for cat_id in (s.get("category_ids") or []))
         ]
 
-    vod_filter = user_settings.get("vod_filter", [])
-    if vod_filter:
-        vod_filter_set = set(str(c) for c in vod_filter)
-        results["vod"] = [s for s in results["vod"] if str(s.get("category_id")) in vod_filter_set]
-
-    series_filter = user_settings.get("series_filter", [])
-    if series_filter:
-        series_filter_set = set(str(c) for c in series_filter)
-        results["series"] = [
-            s for s in results["series"] if str(s.get("category_id")) in series_filter_set
-        ]
+    # The film / series category filters only tidy the browse pages: a search covers the
+    # whole catalog (they used to hide most of it, e.g. every [NL] or [DE] only title).
 
     if lang_matched:
         lang_counts = catalog_lang.option_counts(lang_matched, lang_names)
