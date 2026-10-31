@@ -114,6 +114,8 @@ def related(query: str, kind: str) -> Related:
         result = _fetch(query, kind)
     except Exception as exc:
         log.info("Title search for %r unavailable: %s", query, exc)
+        with _lock:  # don't hammer Wikidata (429): retry this query in 5 minutes
+            _cache[key] = (now - CACHE_SEC + 300, Related())
         return Related()
     with _lock:
         _cache[key] = (now, result)

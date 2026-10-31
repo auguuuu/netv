@@ -2119,6 +2119,7 @@ async def search_page(
     series: bool = False,
     limit: int = 100,
     lang: str = "",
+    everywhere: bool = False,
 ):
     results: dict[str, list] = {"live": [], "vod": [], "series": []}
     limit = limit if 0 < limit <= 500 else 100  # never render an unbounded result list
@@ -2250,8 +2251,15 @@ async def search_page(
             if any(str(cat_id) in guide_filter_set for cat_id in (s.get("category_ids") or []))
         ]
 
-    # The film / series category filters only tidy the browse pages: a search covers the
-    # whole catalog (they used to hide most of it, e.g. every [NL] or [DE] only title).
+    # Category filters from the settings apply to search too, unless ?everywhere=1. What they
+    # hide is counted so the page can say "also in other categories" instead of "no result".
+    hidden: dict[str, int] = {"vod": 0, "series": 0}
+    for kind, key in (("vod", "vod_filter"), ("series", "series_filter")):
+        keep = set(str(c) for c in user_settings.get(key, []))
+        if keep and not everywhere:
+            kept = [s for s in results[kind] if str(s.get("category_id")) in keep]
+            hidden[kind] = len(results[kind]) - len(kept)
+            results[kind] = kept
 
     if lang_matched:
         lang_counts = catalog_lang.option_counts(lang_matched, lang_names)
@@ -2270,6 +2278,8 @@ async def search_page(
             "limit": limit,
             "current_lang": lang,
             "lang_options": _lang_options(lang_counts, lang),
+            "hidden": hidden,
+            "everywhere": everywhere,
             "favorites": user_settings.get("favorites", {"series": {}, "movies": {}}),
             "content_access": content_access,
         },

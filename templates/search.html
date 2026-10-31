@@ -136,7 +136,14 @@
   {% endif %}
 
   {% if not results.live and not results.vod and not results.series %}
-  <p class="text-gray-400 text-xl">Aucun résultat pour « {{ query }} »</p>
+  <p class="text-gray-400 text-xl">Aucun résultat pour « {{ query }} »{% if hidden and (hidden.vod or hidden.series) %} dans tes catégories{% endif %}</p>
+  {% endif %}
+  {% if hidden and (hidden.vod or hidden.series) %}
+  <p class="text-gray-400 mt-4">
+    {% if hidden.vod %}{{ hidden.vod }} film{{ 's' if hidden.vod > 1 }}{% endif %}{% if hidden.vod and hidden.series %} et {% endif %}{% if hidden.series %}{{ hidden.series }} série{{ 's' if hidden.series > 1 }}{% endif %}
+    de plus dans les catégories que tu as masquées (autres langues…) :
+    <a class="underline text-blue-400 focusable" tabindex="0" href="{{ request.url.include_query_params(everywhere=1) }}">les afficher</a>
+  </p>
   {% endif %}
   {% endif %}
   </div>
